@@ -1,7 +1,17 @@
+# Dependencies
 node_modules/
+
+# Secrets — never commit real tokens
 .env
+
+# Runtime state persisted by the app
 data/runtime.json
+
+# Music files (large binaries — upload separately to the VPS/server)
 data/music/*.mp3
 data/music/*.wav
 data/music/*.ogg
+
+# Logs
 *.log
+npm-debug.log*
