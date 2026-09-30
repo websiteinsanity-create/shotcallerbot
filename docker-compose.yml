@@ -1,0 +1,11 @@
+services:
+  shotcaller:
+    build: .
+    container_name: shotcaller
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data

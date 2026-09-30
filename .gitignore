@@ -1,0 +1,7 @@
+node_modules/
+.env
+data/runtime.json
+data/music/*.mp3
+data/music/*.wav
+data/music/*.ogg
+*.log
