@@ -1,33 +1,11 @@
 services:
   shotcaller:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: shotcaller:latest
+    build: .
     container_name: shotcaller
     restart: unless-stopped
-
-    # host networking is required so Discord voice UDP works correctly
     network_mode: host
-
     env_file:
-      - .env
-
+      - path: .env
+        required: false
     volumes:
-      # Persistent runtime state (whisper config, session data, etc.)
       - ./data:/app/data
-
-    # Docker healthcheck hits the built-in HTTP health endpoint
-    healthcheck:
-      test: ["CMD", "node", "-e",
-             "require('http').get('http://localhost:' + (process.env.PORT || 8787) + '/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
-
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
