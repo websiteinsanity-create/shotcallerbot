@@ -147,8 +147,11 @@ async function startSession(i,count,bridge){
 }
 
 http.createServer((req,res)=>{
-  res.writeHead(200,{"content-type":"text/plain"});
-  res.end("Shotcaller OK\n");
+  if(req.method==="GET" && (req.url==="/" || req.url==="/health")){
+    res.writeHead(200,{"content-type":"text/plain"});
+    return res.end("Shotcaller OK\n");
+  }
+  res.writeHead(404);res.end();
 }).listen(config.port,()=>console.log(`Health endpoint on :${config.port}`));
 
 client.login(config.mainToken);
