@@ -1,11 +1,37 @@
 services:
   shotcaller:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build
+    image: shotcaller:latest
     container_name: shotcaller
     restart: unless-stopped
     network_mode: host
-    env_file:
-      - path: .env
-        required: false
+    environment:
+      - MAIN_BOT_TOKEN=${MAIN_BOT_TOKEN}
+      - CLIENT_ID=${CLIENT_ID}
+      - RELAY_BOT_TOKENS=${RELAY_BOT_TOKENS}
+      - DEV_GUILD_ID=${DEV_GUILD_ID:-}
+      - PORT=${PORT:-8787}
+      - SHOTCALLER_ROLE_NAME=${SHOTCALLER_ROLE_NAME:-Shotcaller}
+      - OFFICER_ROLE_NAME=${OFFICER_ROLE_NAME:-Officer}
+      - LEADER_ROLE_NAME=${LEADER_ROLE_NAME:-Leader}
+      - WHISPER_ROLE_NAME=${WHISPER_ROLE_NAME:-Whisper}
+      - PARTY_CATEGORY_NAME=${PARTY_CATEGORY_NAME:-Shotcaller Parties}
+      - BRIDGE_PARTNERS=${BRIDGE_PARTNERS:-}
+      - WHISPER_SILENCE_MS=${WHISPER_SILENCE_MS:-700}
     volumes:
-      - ./data:/app/data
+      - /opt/persistent_volume/shotcallerbot/data:/app/data
+    healthcheck:
+      test: ["CMD", "node", "-e",
+             "require('http').get('http://localhost:' + (process.env.PORT || 8787) + '/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
