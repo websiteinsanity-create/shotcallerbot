@@ -45,7 +45,8 @@ class Session {
 
     this.main=joinVoiceChannel({
       channelId:this.commandVoice.id,guildId:this.guild.id,
-      adapterCreator:this.guild.voiceAdapterCreator,selfDeaf:false,selfMute:false
+      adapterCreator:this.guild.voiceAdapterCreator,selfDeaf:false,selfMute:false,
+      group:"shotcaller-main"
     });
     this.mainPlayer=createAudioPlayer();
     this.main.subscribe(this.mainPlayer);

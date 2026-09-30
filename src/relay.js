@@ -27,7 +27,8 @@ class Relay {
     this.connection = joinVoiceChannel({
       channelId:channel.id,guildId,
       adapterCreator:channel.guild.voiceAdapterCreator,
-      selfDeaf:true,selfMute:false
+      selfDeaf:true,selfMute:false,
+      group:`shotcaller-relay-${this.index}`
     });
     this.connection.on("error",e=>console.error(`[relay ${this.index+1}] connection error:`,e));
     this.connection.on("stateChange",(oldS,newS)=>console.log(`[relay ${this.index+1}] connection: ${oldS.status} -> ${newS.status}`));
