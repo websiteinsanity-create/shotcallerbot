@@ -127,10 +127,21 @@ client.on("interactionCreate",async i=>{
 // reject: every Discord API call inside it is individually caught, so it's always safe for a caller
 // to do `return startSession(...)` without awaiting it.
 async function startSession(i,count,bridge){
+  // Hard guard: reserve this guild's session slot immediately, synchronously, before any slow/async
+  // work. Without this, two near-simultaneous start attempts (e.g. a rare Discord gateway hiccup
+  // re-delivering an interaction) could both pass the earlier "already active" check and each spin up
+  // their own independent Session/relay set for the same guild — duplicate relay bots, duplicate
+  // listeners, chaos. Whoever gets here first claims the slot; anyone else bails out immediately.
+  if(sessions.has(i.guildId)){
+    try{ await i.deferUpdate(); }catch{}
+    return;
+  }
+  sessions.set(i.guildId,null); // placeholder, replaced with the real Session once start() finishes
   try{
     await i.deferUpdate();
   }catch(e){
     console.error("Could not acknowledge the start interaction in time:",e);
+    sessions.delete(i.guildId);
     return;
   }
   try{
@@ -142,6 +153,7 @@ async function startSession(i,count,bridge){
     await i.editReply({content:"Shotcaller started.",components:[]}).catch(e=>console.error("Could not confirm the start:",e));
   }catch(e){
     console.error("Shotcaller failed to start:",e);
+    sessions.delete(i.guildId); // release the reserved slot so a retry isn't permanently blocked
     await i.editReply({content:`Could not start Shotcaller: ${e.message}`,components:[]}).catch(err=>console.error("Could not report the start failure:",err));
   }
 }
