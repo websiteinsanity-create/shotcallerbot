@@ -5,8 +5,8 @@ const {
 } = require("discord.js");
 const http=require("http");
 const config=require("./config");
-const {Session}=require("./session");
-const {canUse,canBridge,canWhisper}=require("./permissions");
+const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
+const {canUse,canBridge}=require("./permissions");
 
 if(!config.mainToken||!config.clientId) throw new Error("Set MAIN_BOT_TOKEN and CLIENT_ID in .env");
 
@@ -79,26 +79,19 @@ client.on("interactionCreate",async i=>{
     const s=sessions.get(i.guildId);
     if(!s) return;
 
-    if(i.isButton() && i.customId==="whisper_toggle"){
-      if(!canWhisper(i.member)) return i.reply({content:`You need the ${config.whisperRoleName} role to use this.`,ephemeral:true}).catch(e=>console.error(e));
-      const on=s.toggleRelay(i.user.id);
-      const secs=Math.round(config.whisperAutoOffMs/1000);
-      return i.reply({content:on?`🎙️ Line to the shotcaller is **OPEN** for the next ${secs}s — say your callout now. It'll close itself automatically, or click again to close it early.`:"🔇 Line closed — back to normal party chat.",ephemeral:true}).catch(e=>console.error(e));
-    }
-
-    if(i.isButton() && i.customId==="secondary_toggle"){
-      if(!s.secondaryCallers.has(i.user.id)) return i.reply({content:"You're not currently set as a secondary caller.",ephemeral:true}).catch(e=>console.error(e));
-      const on=s.toggleSecondary(i.user.id);
-      const secs=Math.round(config.whisperAutoOffMs/1000);
-      return i.reply({content:on?`📢 You're **LIVE to everyone** for the next ${secs}s — every party and the shotcaller can hear you now. It'll close itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
+    if(i.isButton() && i.customId==="callout_toggle"){
+      if(!s.additionalCallers.has(i.user.id)) return i.reply({content:"You're not currently set as an additional caller.",ephemeral:true}).catch(e=>console.error(e));
+      const on=s.toggleCallout(i.user.id);
+      const secs=Math.round(config.calloutAutoOffMs/1000);
+      return i.reply({content:on?`📢 You're **LIVE to everyone** for the next ${secs}s — every other party can hear you now. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
     }
 
     if(!canUse(i.member)) return i.reply({content:"No permission.",ephemeral:true}).catch(e=>console.error(e));
 
     if(i.isButton()){
-      if(i.customId==="mute"){s.muted=!s.muted;if(s.muted)s.audio.stopBroadcast();}
+      if(i.customId==="mute"){s.muted=!s.muted;if(s.muted)s.audio.stop();}
       if(i.customId==="dedicated") return i.reply({content:"Choose the dedicated caller(s):",components:[s.dedicatedMenu()],ephemeral:true}).catch(e=>console.error(e));
-      if(i.customId==="secondary_setup") return i.reply({content:"Choose up to 6 secondary callers — they'll get a button in their party chat to call out to everyone:",components:[s.secondaryMenu()],ephemeral:true}).catch(e=>console.error(e));
+      if(i.customId==="additional_setup") return i.reply({content:`Choose up to ${MAX_ADDITIONAL_CALLERS} additional callers — they get a button in their party chat to call out to every other party:`,components:[s.additionalMenu()],ephemeral:true}).catch(e=>console.error(e));
       if(i.customId==="bridge"){
         if(!canBridge(i.member)) return i.reply({content:"Officer/Leader/Admin required.",ephemeral:true}).catch(e=>console.error(e));
         if(s.bridge?.active) s.bridge=null;
@@ -124,9 +117,9 @@ client.on("interactionCreate",async i=>{
       return;
     }
 
-    if(i.isUserSelectMenu() && i.customId==="secondary_select"){
-      s.secondaryCallers=new Set(i.values);
-      const msg=s.secondaryCallers.size?`Secondary callers set to ${[...s.secondaryCallers].map(id=>`<@${id}>`).join(", ")}.`:"Secondary callers cleared.";
+    if(i.isUserSelectMenu() && i.customId==="additional_select"){
+      s.additionalCallers=new Set(i.values);
+      const msg=s.additionalCallers.size?`Additional callers set to ${[...s.additionalCallers].map(id=>`<@${id}>`).join(", ")}.`:"Additional callers cleared.";
       await i.update({content:msg,components:[]}).catch(e=>console.error(e));
       await s.panelMessage?.edit(s.panel());
       return;
@@ -163,8 +156,9 @@ async function startSession(i,count,bridge){
     sessions.delete(i.guildId);
     return;
   }
+  let s=null;
   try{
-    const s=new Session(i.guild,i.member,count);
+    s=new Session(i.guild,i.member,count);
     await s.start();
     if(bridge)s.bridge={active:false,partnerGuildId:config.bridgePartners.get(i.guildId)||null};
     sessions.set(i.guildId,s);
@@ -173,6 +167,7 @@ async function startSession(i,count,bridge){
   }catch(e){
     console.error("Shotcaller failed to start:",e);
     sessions.delete(i.guildId); // release the reserved slot so a retry isn't permanently blocked
+    try{ await s?.destroy(); }catch(err){ console.error("Cleanup after failed start also failed:",err); } // don't leave half-built channels/relays behind
     await i.editReply({content:`Could not start Shotcaller: ${e.message}`,components:[]}).catch(err=>console.error("Could not report the start failure:",err));
   }
 }

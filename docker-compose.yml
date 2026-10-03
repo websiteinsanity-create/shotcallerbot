@@ -17,10 +17,10 @@ services:
       - SHOTCALLER_ROLE_NAME=${SHOTCALLER_ROLE_NAME:-Shotcaller}
       - OFFICER_ROLE_NAME=${OFFICER_ROLE_NAME:-Officer}
       - LEADER_ROLE_NAME=${LEADER_ROLE_NAME:-Leader}
-      - WHISPER_ROLE_NAME=${WHISPER_ROLE_NAME:-Whisper}
       - PARTY_CATEGORY_NAME=${PARTY_CATEGORY_NAME:-Shotcaller Parties}
       - BRIDGE_PARTNERS=${BRIDGE_PARTNERS:-}
       - WHISPER_SILENCE_MS=${WHISPER_SILENCE_MS:-700}
+      - CALLOUT_AUTO_OFF_MS=${CALLOUT_AUTO_OFF_MS:-20000}
     volumes:
       - /opt/persistent_volume/shotcallerbot/data:/app/data
     healthcheck:
