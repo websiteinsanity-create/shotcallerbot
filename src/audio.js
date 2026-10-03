@@ -1,95 +1,77 @@
-const { EndBehaviorType, createAudioResource, StreamType } = require("@discordjs/voice");
+const { EndBehaviorType } = require("@discordjs/voice");
 const { PassThrough } = require("stream");
 
+// Every party has a relay bot (relays[j] sits in channels[j]; relays[0] is in the shotcaller's own
+// channel). The relays do two jobs: they PLAY audio into their party's channel, and they LISTEN to
+// their party so an additional caller can be picked up from whichever party they're standing in.
 class AudioRouter {
   constructor(session){
     this.s=session;
     this.broadcastStream=null;
-    this.whisperStreams=new Map();
+    this.additionalStreams=new Map(); // userId -> live subscription
   }
 
+  // The primary caller, heard from the shotcaller's own channel, goes to every party EXCEPT that
+  // channel (relays[0]) — the people there already hear the caller live.
   broadcast(userId){
     if(this.s.muted || !userId) return;
     if(this.s.dedicated.size && !this.s.dedicated.has(userId)) return;
-    console.log(`[audio] broadcast() starting for ${userId}, relays: ${this.s.relays.length}`);
+    const targets=this.s.relays.slice(1);
+    if(!targets.length) return;
+    console.log(`[audio] broadcast() starting for ${userId}, parties: ${targets.length}`);
     this.stopBroadcast();
     const stream=this.s.main.receiver.subscribe(userId,{
       end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
     });
     this.broadcastStream=stream;
-    const tees=this.s.relays.map(()=>new PassThrough());
-    tees.forEach((t,i)=>this.s.relays[i].playOpus(t));
+    const tees=targets.map(()=>new PassThrough());
+    tees.forEach((t,i)=>targets[i].playOpus(t));
     let byteCount=0,chunkCount=0;
     const end=()=>{
-      console.log(`[audio] broadcast() ended for ${userId} — received ${chunkCount} chunks, ${byteCount} bytes total`);
+      console.log(`[audio] broadcast() ended for ${userId} — ${chunkCount} chunks, ${byteCount} bytes`);
       tees.forEach(t=>t.end());
       if(this.broadcastStream===stream)this.broadcastStream=null;
     };
     stream.on("data",b=>{
       chunkCount++;byteCount+=b.length;
-      if(chunkCount===1) console.log(`[audio] first chunk received from ${userId}: ${b.length} bytes`);
       if(!this.s.muted)tees.forEach(t=>t.write(b));
     });
     stream.once("end",end);stream.once("close",end);
     stream.once("error",e=>{console.error(`[audio] broadcast stream error for ${userId}:`,e);end();});
   }
 
-  whisper(userId){
-    if(!userId || !this.s.whisperAllowed(userId)) return;
-    if(this.whisperStreams.has(userId)) return;
-    console.log(`[audio] whisper() starting for ${userId}`);
-    const stream=this.s.partyReceiver.subscribe(userId,{
-      end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
-    });
-    this.whisperStreams.set(userId,stream);
-    // Play straight into the shotcaller's own voice connection.
-    this.s.mainPlayer?.play(createAudioResource(stream,{inputType:StreamType.Opus}));
-    let byteCount=0;
-    stream.on("data",b=>{byteCount+=b.length;});
-    const end=()=>{
-      console.log(`[audio] whisper() ended for ${userId} — ${byteCount} bytes total`);
-      this.whisperStreams.delete(userId);
-    };
-    stream.once("end",end);stream.once("close",end);
-    stream.once("error",e=>{console.error(`[audio] whisper stream error for ${userId}:`,e);end();});
-  }
-
-  // A secondary caller's momentary callout: captured from whichever party channel they're actually in
-  // (via that party's own relay receiver), fanned out to every OTHER party's relay AND into the
-  // shotcaller's own connection — same reach as the primary caller speaking, just time-limited and
-  // sourced from wherever the secondary caller happens to be standing.
-  secondaryBroadcast(sourceIndex,userId,receiver){
+  // An additional caller's callout: picked up by the relay of whichever party they're in
+  // (sourceIndex) and played into EVERY OTHER party's channel — including the shotcaller's own, so the
+  // caller and their party hear it too. The source party is skipped; they hear the caller live.
+  additionalBroadcast(sourceIndex,userId,receiver){
     if(this.s.muted || !userId) return;
-    if(!this.secondaryStreams) this.secondaryStreams=new Map();
-    if(this.secondaryStreams.has(userId)) return; // already actively relaying this person
-    console.log(`[audio] secondaryBroadcast() starting for ${userId} from party index ${sourceIndex}`);
+    if(this.additionalStreams.has(userId)) return; // already relaying this person
+    const targets=this.s.relays.filter((_,i)=>i!==sourceIndex);
+    if(!targets.length) return;
+    console.log(`[audio] additional callout starting for ${userId} from party ${sourceIndex+1}, to ${targets.length} parties`);
     const stream=receiver.subscribe(userId,{
       end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
     });
-    this.secondaryStreams.set(userId,stream);
-    const targets=this.s.relays.filter((_,i)=>i!==sourceIndex); // never echo back into their own party
+    this.additionalStreams.set(userId,stream);
     const tees=targets.map(()=>new PassThrough());
     tees.forEach((t,i)=>targets[i].playOpus(t));
-    const mainTee=new PassThrough(); // separate tee for the shotcaller's own connection, avoids two consumers on one stream
-    tees.push(mainTee);
-    this.s.mainPlayer?.play(createAudioResource(mainTee,{inputType:StreamType.Opus}));
     let byteCount=0,chunkCount=0;
     const end=()=>{
-      console.log(`[audio] secondaryBroadcast() ended for ${userId} — ${chunkCount} chunks, ${byteCount} bytes total`);
+      console.log(`[audio] additional callout ended for ${userId} — ${chunkCount} chunks, ${byteCount} bytes`);
       tees.forEach(t=>t.end());
-      this.secondaryStreams.delete(userId);
+      if(this.additionalStreams.get(userId)===stream) this.additionalStreams.delete(userId);
     };
     stream.on("data",b=>{
       chunkCount++;byteCount+=b.length;
       if(!this.s.muted)tees.forEach(t=>t.write(b));
     });
     stream.once("end",end);stream.once("close",end);
-    stream.once("error",e=>{console.error(`[audio] secondaryBroadcast stream error for ${userId}:`,e);end();});
+    stream.once("error",e=>{console.error(`[audio] additional callout stream error for ${userId}:`,e);end();});
   }
 
   stopBroadcast(){try{this.broadcastStream?.destroy()}catch{}this.broadcastStream=null}
-  stopWhispers(){for(const s of this.whisperStreams.values()){try{s.destroy()}catch{}}this.whisperStreams.clear()}
-  stopSecondary(){if(this.secondaryStreams)for(const s of this.secondaryStreams.values()){try{s.destroy()}catch{}}this.secondaryStreams?.clear()}
-  stop(){this.stopBroadcast();this.stopWhispers();this.stopSecondary()}
+  stopAdditionalFor(userId){try{this.additionalStreams.get(userId)?.destroy()}catch{}}
+  stopAdditional(){for(const st of this.additionalStreams.values()){try{st.destroy()}catch{}}this.additionalStreams.clear()}
+  stop(){this.stopBroadcast();this.stopAdditional()}
 }
 module.exports={AudioRouter};

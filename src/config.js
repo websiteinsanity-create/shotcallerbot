@@ -13,12 +13,12 @@ module.exports = {
   shotcallerRoleName: process.env.SHOTCALLER_ROLE_NAME || "Shotcaller",
   officerRoleName: process.env.OFFICER_ROLE_NAME || "Officer",
   leaderRoleName: process.env.LEADER_ROLE_NAME || "Leader",
-  whisperRoleName: process.env.WHISPER_ROLE_NAME || "Whisper",
   partyCategoryName: process.env.PARTY_CATEGORY_NAME || "Shotcaller Parties",
   bridgePartners,
   port: Number(process.env.PORT || 8787),
+  // How long a speaker must be silent before their relayed stream is ended.
   whisperSilenceMs: Number(process.env.WHISPER_SILENCE_MS || 700),
-  // How long a single whisper-toggle press stays open before auto-closing itself, so a quick
-  // callout can't accidentally turn into a continuous open line if someone forgets to toggle it off.
-  whisperAutoOffMs: Number(process.env.WHISPER_AUTO_OFF_MS || 20000)
+  // How long a single additional-caller callout stays open (button press, or a held priority key)
+  // before closing itself, so a callout can never turn into a continuous open line.
+  calloutAutoOffMs: Number(process.env.CALLOUT_AUTO_OFF_MS || process.env.WHISPER_AUTO_OFF_MS || 20000)
 };
