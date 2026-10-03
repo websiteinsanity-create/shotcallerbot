@@ -82,14 +82,23 @@ client.on("interactionCreate",async i=>{
     if(i.isButton() && i.customId==="whisper_toggle"){
       if(!canWhisper(i.member)) return i.reply({content:`You need the ${config.whisperRoleName} role to use this.`,ephemeral:true}).catch(e=>console.error(e));
       const on=s.toggleRelay(i.user.id);
-      return i.reply({content:on?"🎙️ Whisper line to the shotcaller is **ON** — they can hear you now.":"🔇 Whisper line to the shotcaller is **OFF** — back to normal party chat.",ephemeral:true}).catch(e=>console.error(e));
+      const secs=Math.round(config.whisperAutoOffMs/1000);
+      return i.reply({content:on?`🎙️ Line to the shotcaller is **OPEN** for the next ${secs}s — say your callout now. It'll close itself automatically, or click again to close it early.`:"🔇 Line closed — back to normal party chat.",ephemeral:true}).catch(e=>console.error(e));
+    }
+
+    if(i.isButton() && i.customId==="secondary_toggle"){
+      if(!s.secondaryCallers.has(i.user.id)) return i.reply({content:"You're not currently set as a secondary caller.",ephemeral:true}).catch(e=>console.error(e));
+      const on=s.toggleSecondary(i.user.id);
+      const secs=Math.round(config.whisperAutoOffMs/1000);
+      return i.reply({content:on?`📢 You're **LIVE to everyone** for the next ${secs}s — every party and the shotcaller can hear you now. It'll close itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
     }
 
     if(!canUse(i.member)) return i.reply({content:"No permission.",ephemeral:true}).catch(e=>console.error(e));
 
     if(i.isButton()){
       if(i.customId==="mute"){s.muted=!s.muted;if(s.muted)s.audio.stopBroadcast();}
-      if(i.customId==="dedicated") return i.reply({content:"Choose the dedicated caller:",components:[s.dedicatedMenu()],ephemeral:true}).catch(e=>console.error(e));
+      if(i.customId==="dedicated") return i.reply({content:"Choose the dedicated caller(s):",components:[s.dedicatedMenu()],ephemeral:true}).catch(e=>console.error(e));
+      if(i.customId==="secondary_setup") return i.reply({content:"Choose up to 6 secondary callers — they'll get a button in their party chat to call out to everyone:",components:[s.secondaryMenu()],ephemeral:true}).catch(e=>console.error(e));
       if(i.customId==="bridge"){
         if(!canBridge(i.member)) return i.reply({content:"Officer/Leader/Admin required.",ephemeral:true}).catch(e=>console.error(e));
         if(s.bridge?.active) s.bridge=null;
@@ -108,8 +117,18 @@ client.on("interactionCreate",async i=>{
     }
 
     if(i.isUserSelectMenu() && i.customId==="dedicated_select"){
-      s.dedicated=i.values[0];s.audio.stopBroadcast();
-      await i.update({content:`Dedicated caller set to <@${s.dedicated}>.`,components:[]}).catch(e=>console.error(e));
+      s.dedicated=new Set(i.values);s.audio.stopBroadcast();
+      const msg=s.dedicated.size?`Dedicated caller(s) set to ${[...s.dedicated].map(id=>`<@${id}>`).join(", ")}.`:"Dedicated mode cleared — anyone can broadcast again.";
+      await i.update({content:msg,components:[]}).catch(e=>console.error(e));
+      await s.panelMessage?.edit(s.panel());
+      return;
+    }
+
+    if(i.isUserSelectMenu() && i.customId==="secondary_select"){
+      s.secondaryCallers=new Set(i.values);
+      const msg=s.secondaryCallers.size?`Secondary callers set to ${[...s.secondaryCallers].map(id=>`<@${id}>`).join(", ")}.`:"Secondary callers cleared.";
+      await i.update({content:msg,components:[]}).catch(e=>console.error(e));
+      await s.panelMessage?.edit(s.panel());
       return;
     }
 

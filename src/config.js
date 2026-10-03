@@ -17,5 +17,8 @@ module.exports = {
   partyCategoryName: process.env.PARTY_CATEGORY_NAME || "Shotcaller Parties",
   bridgePartners,
   port: Number(process.env.PORT || 8787),
-  whisperSilenceMs: Number(process.env.WHISPER_SILENCE_MS || 700)
+  whisperSilenceMs: Number(process.env.WHISPER_SILENCE_MS || 700),
+  // How long a single whisper-toggle press stays open before auto-closing itself, so a quick
+  // callout can't accidentally turn into a continuous open line if someone forgets to toggle it off.
+  whisperAutoOffMs: Number(process.env.WHISPER_AUTO_OFF_MS || 20000)
 };
