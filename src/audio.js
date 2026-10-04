@@ -1,6 +1,12 @@
 const { EndBehaviorType } = require("@discordjs/voice");
 const { PassThrough } = require("stream");
 
+// The relays' players expect every read to return exactly ONE Opus packet. A plain (byte-mode) PassThrough
+// glues together whatever has piled up between two 20ms player ticks, so two packets come out as one
+// malformed blob — which listeners hear as robotic, compressed, glitchy audio. Object mode keeps each
+// packet separate.
+const packetTee=()=>new PassThrough({objectMode:true});
+
 // receiver.subscribe() hands back the SAME stream if one is already registered for that user, and a stream we
 // have just destroy()ed stays registered until its "close" event fires. So subscribing straight after a destroy
 // returns a dead stream — the pipeline built on it ends instantly with 0 bytes. Always make sure we get a live one.
@@ -40,7 +46,7 @@ class AudioRouter {
       end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
     });
     this.broadcastStream=stream; this.broadcastUser=userId;
-    const tees=targets.map(()=>new PassThrough());
+    const tees=targets.map(packetTee);
     tees.forEach((t,i)=>targets[i].playOpus(t));
     let byteCount=0,chunkCount=0,done=false;
     const end=()=>{
@@ -70,7 +76,7 @@ class AudioRouter {
       end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
     });
     this.additionalStreams.set(userId,stream);
-    const tees=targets.map(()=>new PassThrough());
+    const tees=targets.map(packetTee);
     tees.forEach((t,i)=>targets[i].playOpus(t));
     let byteCount=0,chunkCount=0,done=false;
     const end=()=>{
