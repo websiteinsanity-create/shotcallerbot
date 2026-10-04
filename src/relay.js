@@ -25,7 +25,9 @@ class Relay {
       intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildVoiceStates]
     });
     this.connection = null;
-    this.voicePlayer = createAudioPlayer();
+    // maxMissedFrames: by default the player gives up after 5 empty 20ms ticks (100ms). Network jitter easily causes
+    // that, so let it ride out up to a second of gap instead of dropping the rest of the sentence.
+    this.voicePlayer = createAudioPlayer({ behaviors: { maxMissedFrames: 50 } });
     this.client.once("ready",()=>console.log(`[relay ${index+1}] ${this.client.user.tag} ready`));
     this.client.on("error",e=>console.error(`[relay ${index+1}] client error:`,e));
     this.voicePlayer.on("error",e=>console.error(`[relay ${index+1}] player error:`,e));
