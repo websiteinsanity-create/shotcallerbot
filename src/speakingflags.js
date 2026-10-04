@@ -9,11 +9,19 @@
 // That relies on library internals, which is why this is a probe first and not a feature.
 
 function watchSpeakingFlags(connection, label, onFlags) {
+  const seenOps = new Set();
   const attach = (ws) => {
     if (!ws || ws.__flagsWatched) return;
     ws.__flagsWatched = true;
+    console.log(`[flags] ${label}: listening on the voice socket`);
     ws.on("packet", (p) => {
       try {
+        // Log each kind of voice message the first time it shows up, so a silent probe can be told apart
+        // from "Discord just never sends speaking info to bots".
+        if (p && typeof p.op === "number" && !seenOps.has(p.op)) {
+          seenOps.add(p.op);
+          console.log(`[flags] ${label}: first voice message of type op ${p.op}`);
+        }
         if (p && p.op === 5 && p.d) {
           const flags = Number(p.d.speaking);
           console.log(`[flags] ${label} user=${p.d.user_id} speaking=${flags}${flags & 4 ? "  <-- PRIORITY" : ""}`);
