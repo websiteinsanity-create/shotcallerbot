@@ -72,9 +72,9 @@ class Session {
 
     for(let j=0;j<this.channels.length;j++){
       const relay=new Relay(config.relayTokens[j],j,{onFlags:(u,f)=>this.onSpeakingFlags(u,f)});
+      this.relays.push(relay); // registered first, so destroy() cleans it up even if login/connect fails
       await relay.login();
       await relay.connect(this.channels[j].id,this.guild.id);
-      this.relays.push(relay);
     }
 
     this.audio=new AudioRouter(this);
