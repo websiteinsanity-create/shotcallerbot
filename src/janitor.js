@@ -6,21 +6,51 @@
 //   run (e.g. the bot was restarted mid-session, so its in-memory list was lost) gets the same treatment.
 // - Failures are logged, never swallowed, so a permissions problem is visible instead of silently leaving channels.
 
+const fs = require("fs");
+const path = require("path");
 const { ChannelType } = require("discord.js");
 const config = require("./config");
 
 const watched = new Map();   // channelId -> channel, waiting for the last person to leave
 const warned = new Set();    // channelIds we've already logged a failure for (don't spam the log)
 
+// The ids of channels this bot created, kept in a small file so they can still be found after a restart.
+// Only channels listed here (or legacy ones inside the old Shotcaller category) are ever deleted — never
+// something that merely happens to be called "Party 2".
+let registryWarned = false;
+const registryFile = () => path.join(config.dataDir, "party-channels.json");
+function loadRegistry() { try { return JSON.parse(fs.readFileSync(registryFile(), "utf8")); } catch { return {}; } }
+function saveRegistry(reg) {
+  try { fs.mkdirSync(config.dataDir, { recursive: true }); fs.writeFileSync(registryFile(), JSON.stringify(reg)); }
+  catch (e) {
+    if (!registryWarned) { registryWarned = true; console.warn(`[cleanup] couldn't save the channel list (${e.message}) — channels left behind by a restart won't be found`); }
+  }
+}
+function track(ch) {
+  const gid = ch.guildId || (ch.guild && ch.guild.id) || "unknown";
+  const reg = loadRegistry();
+  reg[gid] = [...new Set([...(reg[gid] || []), ch.id])];
+  saveRegistry(reg);
+}
+function untrack(channelId) {
+  const reg = loadRegistry(); let changed = false;
+  for (const gid of Object.keys(reg)) {
+    const kept = reg[gid].filter((id) => id !== channelId);
+    if (kept.length !== reg[gid].length) { changed = true; reg[gid] = kept; }
+    if (!reg[gid].length) delete reg[gid];
+  }
+  if (changed) saveRegistry(reg);
+}
+
 const humans = (ch) => (ch.members ? [...ch.members.values()].filter((m) => !m.user?.bot).length : 0);
 
 async function tryDelete(ch, reason) {
   try {
     await ch.delete(reason);
-    watched.delete(ch.id); warned.delete(ch.id);
+    watched.delete(ch.id); warned.delete(ch.id); untrack(ch.id);
     return true;
   } catch (e) {
-    if (e.code === 10003) { watched.delete(ch.id); warned.delete(ch.id); return true; } // already gone
+    if (e.code === 10003) { watched.delete(ch.id); warned.delete(ch.id); untrack(ch.id); return true; } // already gone
     if (!warned.has(ch.id)) {
       warned.add(ch.id);
       console.warn(`[cleanup] could not delete "${ch.name}": ${e.message} — will keep retrying whenever it changes`);
@@ -46,18 +76,35 @@ async function onVoiceUpdate(oldState, newState) {
   }
 }
 
-function forget(channelId) { watched.delete(channelId); warned.delete(channelId); }
+// A channel was deleted by someone (or by us): stop tracking it.
+function forget(ch) { watched.delete(ch.id); warned.delete(ch.id); untrack(ch.id); }
 
-// Find "Party N" voice channels left in the Shotcaller category by an earlier run.
+// Find channels an earlier run left behind: everything on the bot's own list, plus (from before that list
+// existed) "Party N" voice channels inside the old Shotcaller category.
 async function sweep(guild) {
+  const found = new Map();
+  for (const id of loadRegistry()[guild.id] || []) {
+    const ch = guild.channels.cache.get(id);
+    if (ch) found.set(id, ch); else untrack(id); // already gone
+  }
   const cat = guild.channels.cache.find((c) => c.type === ChannelType.GuildCategory && c.name === config.partyCategoryName);
-  if (!cat) return 0;
-  const leftovers = [...guild.channels.cache.values()].filter(
-    (c) => c.parentId === cat.id && c.type === ChannelType.GuildVoice && /^Party \d+$/.test(c.name)
-  );
-  if (leftovers.length) console.log(`[cleanup] found ${leftovers.length} leftover party channel(s) in "${cat.name}"`);
-  for (const c of leftovers) await retire(c);
-  return leftovers.length;
+  if (cat) {
+    for (const c of guild.channels.cache.values()) {
+      if (c.parentId === cat.id && c.type === ChannelType.GuildVoice && /^Party \d+$/.test(c.name)) found.set(c.id, c);
+    }
+  }
+  if (found.size) console.log(`[cleanup] found ${found.size} leftover party channel(s) from an earlier session`);
+  for (const c of found.values()) await retire(c);
+
+  // The bot no longer uses its own category in "inplace" mode, so tidy an empty one away.
+  if (cat && config.partyPlacement === "inplace") {
+    const kids = [...guild.channels.cache.values()].filter((c) => c.parentId === cat.id);
+    if (!kids.length) {
+      try { await cat.delete("Shotcaller no longer uses its own category"); console.log(`[cleanup] removed the empty "${cat.name}" category`); }
+      catch (e) { console.warn(`[cleanup] couldn't remove the empty "${cat.name}" category: ${e.message}`); }
+    }
+  }
+  return found.size;
 }
 
-module.exports = { retire, onVoiceUpdate, forget, sweep, _watched: watched };
+module.exports = { track, retire, onVoiceUpdate, forget, sweep, _watched: watched };

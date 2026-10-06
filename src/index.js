@@ -40,7 +40,7 @@ client.once("ready",async()=>{
 });
 // After a session stops, occupied party channels are deleted the moment the last person leaves.
 client.on("voiceStateUpdate",(o,n)=>{ janitor.onVoiceUpdate(o,n).catch(e=>console.error("[cleanup]",e)); });
-client.on("channelDelete",ch=>janitor.forget(ch.id));
+client.on("channelDelete",ch=>janitor.forget(ch));
 
 client.on("interactionCreate",async i=>{
   try{
