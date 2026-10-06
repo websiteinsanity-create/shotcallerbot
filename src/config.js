@@ -14,6 +14,11 @@ module.exports = {
   officerRoleName: process.env.OFFICER_ROLE_NAME || "Officer",
   leaderRoleName: process.env.LEADER_ROLE_NAME || "Leader",
   partyCategoryName: process.env.PARTY_CATEGORY_NAME || "Shotcaller Parties",
+  // Anyone holding this role can make callouts to every party, automatically — no picking people each game.
+  // Where the Shotcaller category sits in the channel list (0 = very top). Leave unset to put it wherever you
+  // dragged it — the bot reuses the same category every game, so a manual drag sticks.
+  partyCategoryPosition: (() => { const r = process.env.PARTY_CATEGORY_POSITION; return r !== undefined && r.trim() !== "" && Number.isInteger(Number(r)) && Number(r) >= 0 ? Number(r) : null; })(),
+  additionalCallerRoleName: process.env.ADDITIONAL_CALLER_ROLE_NAME || "Shotcaller-People",
   bridgePartners,
   port: Number(process.env.PORT || 8787),
   // How long a speaker must be silent before their relayed stream is ended.
