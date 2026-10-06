@@ -23,6 +23,7 @@ services:
       - CALLOUT_AUTO_OFF_MS=${CALLOUT_AUTO_OFF_MS:-20000}
       - ADDITIONAL_CALLER_ROLE_NAME=${ADDITIONAL_CALLER_ROLE_NAME:-Shotcaller-People}
       - PARTY_CATEGORY_POSITION=${PARTY_CATEGORY_POSITION:-}
+      - PARTY_PLACEMENT=${PARTY_PLACEMENT:-inplace}
     volumes:
       - /opt/persistent_volume/shotcallerbot/data:/app/data
     healthcheck:

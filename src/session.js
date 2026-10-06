@@ -43,22 +43,7 @@ class Session {
     await this.loadCallers();
 
     this.channels=[this.commandVoice];
-    if(this.count>1){
-      // Clear out any "Party N" channels an earlier run left behind (empty ones go now, occupied ones when they empty).
-      await janitor.sweep(this.guild).catch(e=>console.warn("[cleanup] sweep failed:",e.message));
-      let cat=this.guild.channels.cache.find(c=>c.type===ChannelType.GuildCategory && c.name===config.partyCategoryName);
-      const wantPos=config.partyCategoryPosition;
-      if(!cat) cat=await this.guild.channels.create({name:config.partyCategoryName,type:ChannelType.GuildCategory,...(wantPos!==null?{position:wantPos}:{})});
-      else if(wantPos!==null && cat.position!==wantPos) await cat.setPosition(wantPos).catch(e=>console.warn(`[cleanup] couldn't move the category to position ${wantPos}: ${e.message}`));
-      for(let i=1;i<this.count;i++){
-        const c=await this.guild.channels.create({
-          name:`Party ${i+1}`,type:ChannelType.GuildVoice,parent:cat.id,
-          permissionOverwrites:[{id:this.guild.roles.everyone.id,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.Connect,PermissionFlagsBits.Speak]}]
-        });
-        this.channels.push(c);
-        this.createdChannels.push(c);
-      }
-    }
+    if(this.count>1) await this.createPartyChannels();
 
     // Post the callout button in every party's chat (the shotcaller's own channel too — best effort,
     // since that's an existing channel the bot may not be allowed to post in).
@@ -97,6 +82,49 @@ class Session {
       receiver.speaking.on("start",userId=>{
         if(this.additionalCallActive(userId)) this.audio.additionalBroadcast(j,userId,receiver);
       });
+    }
+  }
+
+  // Creates Party 2..N. Where they go depends on PARTY_PLACEMENT:
+  //  "inplace"  — in the same category as the shotcaller's own channel, with that channel's permissions copied
+  //               across, so exactly the people who can see and join the shotcaller's channel can see and join
+  //               the parties (and nothing is accidentally opened up to the whole server).
+  //  "category" — the old behaviour: a separate "Shotcaller Parties" category, open to everyone.
+  async createPartyChannels(){
+    // Clear out any channels an earlier run left behind (empty ones go now, occupied ones when they empty).
+    await janitor.sweep(this.guild).catch(e=>console.warn("[cleanup] sweep failed:",e.message));
+
+    let parentId=null, overwrites;
+    if(config.partyPlacement==="category"){
+      let cat=this.guild.channels.cache.find(c=>c.type===ChannelType.GuildCategory && c.name===config.partyCategoryName);
+      const wantPos=config.partyCategoryPosition;
+      if(!cat) cat=await this.guild.channels.create({name:config.partyCategoryName,type:ChannelType.GuildCategory,...(wantPos!==null?{position:wantPos}:{})});
+      else if(wantPos!==null && cat.position!==wantPos) await cat.setPosition(wantPos).catch(e=>console.warn(`[cleanup] couldn't move the category to position ${wantPos}: ${e.message}`));
+      parentId=cat.id;
+      overwrites=[{id:this.guild.roles.everyone.id,allow:[PermissionFlagsBits.ViewChannel,PermissionFlagsBits.Connect,PermissionFlagsBits.Speak]}];
+    }else{
+      parentId=this.commandVoice.parentId||null;
+      overwrites=[...(this.commandVoice.permissionOverwrites?.cache?.values?.()||[])].map(o=>({id:o.id,type:o.type,allow:o.allow.bitfield,deny:o.deny.bitfield}));
+    }
+
+    for(let i=1;i<this.count;i++){
+      const c=await this.makePartyChannel(`Party ${i+1}`,parentId,overwrites);
+      janitor.track(c); // remembered on disk straight away, so cleanup can still find it after a restart
+      this.channels.push(c);
+      this.createdChannels.push(c);
+    }
+  }
+
+  async makePartyChannel(name,parentId,overwrites){
+    const base={name,type:ChannelType.GuildVoice,...(parentId?{parent:parentId}:{})};
+    try{
+      return await this.guild.channels.create({...base,permissionOverwrites:overwrites});
+    }catch(e){
+      // Discord refuses to hand out a permission the bot doesn't hold itself, so copying a channel that grants
+      // something unusual can be rejected. Fall back to simply inheriting from the category.
+      if(e.code!==50013 || config.partyPlacement==="category") throw e;
+      console.warn(`[session] couldn't copy your channel's permissions onto "${name}" (${e.message}) — creating it to inherit from its category instead`);
+      return await this.guild.channels.create(base);
     }
   }
 
