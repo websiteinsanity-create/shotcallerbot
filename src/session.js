@@ -8,6 +8,7 @@ const config = require("./config");
 const { Relay } = require("./relay");
 const { AudioRouter } = require("./audio");
 const { watchSpeakingFlags } = require("./speakingflags");
+const janitor = require("./janitor");
 
 // Discord's user-select menu allows at most 25 choices, so this can go up to 25.
 const MAX_ADDITIONAL_CALLERS=16;
@@ -22,7 +23,10 @@ class Session {
     // Whoever runs /shotcaller start is the primary caller by default (adjustable with the Dedicated button).
     this.dedicated=new Set([member.id]);
     // Additional callers (up to MAX_ADDITIONAL_CALLERS): can push a time-limited callout from ANY party out to every other party.
+    // Anyone with the configured role is an additional caller automatically (see isAdditionalCaller);
+    // this set is just optional per-game extras on top of that.
     this.additionalCallers=new Set();
+    this.callerRoleId=null; this.fetchingMembers=new Set();
     this.calloutOpen=new Map(); this.calloutTimers=new Map();   // button window: userId -> bool / timer
     this.priorityHeld=new Map(); this.priorityTimers=new Map(); // held Push to Talk (Priority) key
     this.bridge=null; this.panelMessage=null; this.main=null;
@@ -36,10 +40,16 @@ class Session {
       throw new Error(`Need one relay bot per party (including your own): ${this.count} parties but only ${config.relayTokens.length} relay token(s) configured.`);
     }
 
+    await this.loadCallers();
+
     this.channels=[this.commandVoice];
     if(this.count>1){
+      // Clear out any "Party N" channels an earlier run left behind (empty ones go now, occupied ones when they empty).
+      await janitor.sweep(this.guild).catch(e=>console.warn("[cleanup] sweep failed:",e.message));
       let cat=this.guild.channels.cache.find(c=>c.type===ChannelType.GuildCategory && c.name===config.partyCategoryName);
-      if(!cat) cat=await this.guild.channels.create({name:config.partyCategoryName,type:ChannelType.GuildCategory});
+      const wantPos=config.partyCategoryPosition;
+      if(!cat) cat=await this.guild.channels.create({name:config.partyCategoryName,type:ChannelType.GuildCategory,...(wantPos!==null?{position:wantPos}:{})});
+      else if(wantPos!==null && cat.position!==wantPos) await cat.setPosition(wantPos).catch(e=>console.warn(`[cleanup] couldn't move the category to position ${wantPos}: ${e.message}`));
       for(let i=1;i<this.count;i++){
         const c=await this.guild.channels.create({
           name:`Party ${i+1}`,type:ChannelType.GuildVoice,parent:cat.id,
@@ -55,7 +65,7 @@ class Session {
     const secs=Math.round(config.calloutAutoOffMs/1000);
     for(const c of this.channels){
       await c.send({
-        content:`🎙️ Talk normally with your party here.\nAdditional callers: press the button for a ${secs}-second callout heard by every other party.`,
+        content:`🎙️ Talk normally with your party here.\nAdditional callers (**${config.additionalCallerRoleName}** role): press the button for a ${secs}-second callout heard by every other party.`,
         components:[this.calloutRow()]
       }).catch(()=>{});
     }
@@ -92,9 +102,42 @@ class Session {
 
   // ---- Additional callers ----
 
+  // Find the caller role and warm the member cache so role checks can be answered instantly while audio is flowing.
+  async loadCallers(){
+    const want=config.additionalCallerRoleName.toLowerCase();
+    const role=this.guild.roles?.cache?.find(r=>r.name.toLowerCase()===want);
+    this.callerRoleId=role?.id||null;
+    if(!role){
+      console.warn(`[callers] no role named "${config.additionalCallerRoleName}" found — only extra callers added by hand will work`);
+      return;
+    }
+    try{ await this.guild.members.fetch(); }
+    catch(e){ console.warn(`[callers] couldn't load the full member list (${e.message}) — members are picked up as they speak`); }
+    console.log(`[callers] role "${role.name}": ${role.members?.size ?? "?"} member(s) can call out`);
+  }
+
+  hasCallerRole(userId){
+    if(!this.callerRoleId) return false;
+    const member=this.guild.members.cache.get(userId);
+    if(!member){
+      // Not in the cache yet (e.g. a very large server): fetch them once in the background so the next try works.
+      if(!this.fetchingMembers.has(userId)){
+        this.fetchingMembers.add(userId);
+        this.guild.members.fetch(userId).catch(()=>{}).finally(()=>this.fetchingMembers.delete(userId));
+      }
+      return false;
+    }
+    return member.roles.cache.has(this.callerRoleId);
+  }
+
+  // Role holders are additional callers automatically; the manual picker only adds extras on top.
+  isAdditionalCaller(userId){
+    return this.additionalCallers.has(userId) || this.hasCallerRole(userId);
+  }
+
   // Is this person allowed to be heard by everyone right now? (button window open, or priority key held)
   additionalCallActive(userId){
-    if(!this.additionalCallers.has(userId)) return false;
+    if(!this.isAdditionalCaller(userId)) return false;
     if(this.dedicated.has(userId)) return false; // the primary caller is already handled by the main broadcast
     return this.calloutOpen.get(userId)===true || this.priorityHeld.get(userId)===true;
   }
@@ -115,7 +158,7 @@ class Session {
 
   // Button: opens a window of calloutAutoOffMs, closes itself, or click again to close early.
   toggleCallout(userId){
-    if(!this.additionalCallers.has(userId)) return null; // caller shows the "not authorised" message
+    if(!this.isAdditionalCaller(userId)) return null; // caller shows the "not authorised" message
     clearTimeout(this.calloutTimers.get(userId));
     const next=!(this.calloutOpen.get(userId)===true);
     this.calloutOpen.set(userId,next);
@@ -135,7 +178,7 @@ class Session {
   // "Push to Talk (Priority)" keybind should set — held key = open line, released = closed.
   // (Unverified until the [flags] log lines have been checked against a real key press.)
   onSpeakingFlags(userId,flags){
-    if(!this.additionalCallers.has(userId)) return;
+    if(!this.isAdditionalCaller(userId)) return;
     const held=(Number(flags)&4)!==0;
     if(held===(this.priorityHeld.get(userId)===true)) return;
     clearTimeout(this.priorityTimers.get(userId));
@@ -162,7 +205,7 @@ class Session {
 
   additionalMenu(){
     return new ActionRowBuilder().addComponents(
-      new UserSelectMenuBuilder().setCustomId("additional_select").setPlaceholder(`Pick additional callers (up to ${MAX_ADDITIONAL_CALLERS}) — select none to clear`).setMinValues(0).setMaxValues(MAX_ADDITIONAL_CALLERS)
+      new UserSelectMenuBuilder().setCustomId("additional_select").setPlaceholder(`Extra callers for this game, on top of the role (up to ${MAX_ADDITIONAL_CALLERS}) — none to clear`).setMinValues(0).setMaxValues(MAX_ADDITIONAL_CALLERS)
     );
   }
 
@@ -177,12 +220,9 @@ class Session {
     this.audio?.stop();
     this.relays.forEach(r=>r.destroy());
     try{this.main?.destroy()}catch{}
-    // Only delete channels that are now empty — never force-disconnect people still using them.
-    for(const c of this.createdChannels){
-      const fresh=await c.fetch().catch(()=>c);
-      const humans=fresh.members ? [...fresh.members.values()].filter(m=>!m.user?.bot).length : 0;
-      if(humans===0) await fresh.delete("Shotcaller session ended").catch(()=>{});
-    }
+    // Empty channels are deleted now. Ones with people still in them are left alone (nobody gets kicked) and
+    // deleted by the janitor the moment they empty.
+    for(const c of this.createdChannels) await janitor.retire(c);
     this.channels=[]; this.createdChannels=[];
   }
 
@@ -194,17 +234,17 @@ class Session {
     }).join("\n");
     const names=set=>[...set].map(id=>`<@${id}>`).join(", ");
     const e=new EmbedBuilder().setTitle("📣 Shotcaller Panel")
-      .setDescription(`${parties}\n\nAdditional callers get a button in each party's chat for a ${secs}-second callout heard by every other party.`)
+      .setDescription(`${parties}\n\nAnyone with the **${config.additionalCallerRoleName}** role can call out to every other party (button in each party's chat, ${secs}s).`)
       .addFields(
         {name:"Audio",value:this.muted?"🔇 Muted":"🔊 Active",inline:true},
         {name:"Dedicated",value:this.dedicated.size?names(this.dedicated):"Off (anyone)",inline:true},
-        {name:"Additional callers",value:this.additionalCallers.size?names(this.additionalCallers):"None set",inline:true},
+        {name:"Additional callers",value:[this.callerRoleId?`<@&${this.callerRoleId}> role`:`⚠️ role "${config.additionalCallerRoleName}" not found`,...(this.additionalCallers.size?[`+ extras: ${names(this.additionalCallers)}`]:[])].join("\n"),inline:true},
         {name:"Bridge",value:this.bridge?.active?"Active":"Off",inline:true}
       );
     const buttons=new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("mute").setLabel(this.muted?"Unmute":"Mute").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("dedicated").setLabel("Dedicated").setStyle(ButtonStyle.Primary),
-      new ButtonBuilder().setCustomId("additional_setup").setLabel("Additional Callers").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId("additional_setup").setLabel("Extra Callers").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("bridge").setLabel(this.bridge?.active?"End Bridge":"Bridge").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("stop").setLabel("Stop").setStyle(ButtonStyle.Danger)
     );

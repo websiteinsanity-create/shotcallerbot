@@ -6,6 +6,7 @@ const {
 const http=require("http");
 const config=require("./config");
 const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
+const janitor=require("./janitor");
 const {canUse,canBridge}=require("./permissions");
 
 if(!config.mainToken||!config.clientId) throw new Error("Set MAIN_BOT_TOKEN and CLIENT_ID in .env");
@@ -31,7 +32,15 @@ async function register(){
   await rest.put(route,{body:[command.toJSON()]});
 }
 
-client.once("ready",async()=>{console.log(`Shotcaller online as ${client.user.tag}`);await register()});
+client.once("ready",async()=>{
+  console.log(`Shotcaller online as ${client.user.tag}`);
+  await register();
+  // Tidy up after any earlier run that stopped or restarted before it could clean its channels.
+  for(const guild of client.guilds.cache.values()) await janitor.sweep(guild).catch(e=>console.warn("[cleanup] startup sweep failed:",e.message));
+});
+// After a session stops, occupied party channels are deleted the moment the last person leaves.
+client.on("voiceStateUpdate",(o,n)=>{ janitor.onVoiceUpdate(o,n).catch(e=>console.error("[cleanup]",e)); });
+client.on("channelDelete",ch=>janitor.forget(ch.id));
 
 client.on("interactionCreate",async i=>{
   try{
@@ -42,7 +51,7 @@ client.on("interactionCreate",async i=>{
         const s=sessions.get(i.guildId);
         if(!s) return i.reply({content:"No active Shotcaller session to stop.",ephemeral:true}).catch(e=>console.error(e));
         if(!canUse(i.member)) return i.reply({content:"You need the Shotcaller, Officer, Leader or Administrator permission.",ephemeral:true}).catch(e=>console.error(e));
-        await i.reply({content:"Stopping Shotcaller and cleaning up party channels…",ephemeral:true}).catch(e=>console.error(e));
+        await i.reply({content:"Stopping Shotcaller. Empty party channels are deleted now; any with people still in them are deleted as soon as they empty.",ephemeral:true}).catch(e=>console.error(e));
         await s.destroy();sessions.delete(i.guildId);
         try{ await s.panelMessage?.edit({content:"Shotcaller stopped.",embeds:[],components:[]}); }catch{}
         return;
@@ -80,7 +89,7 @@ client.on("interactionCreate",async i=>{
     if(!s) return;
 
     if(i.isButton() && i.customId==="callout_toggle"){
-      if(!s.additionalCallers.has(i.user.id)) return i.reply({content:"You're not currently set as an additional caller.",ephemeral:true}).catch(e=>console.error(e));
+      if(!s.isAdditionalCaller(i.user.id)) return i.reply({content:`You need the ${config.additionalCallerRoleName} role to make callouts.`,ephemeral:true}).catch(e=>console.error(e));
       const on=s.toggleCallout(i.user.id);
       const secs=Math.round(config.calloutAutoOffMs/1000);
       return i.reply({content:on?`📢 You're **LIVE to everyone** for the next ${secs}s — every other party can hear you now. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
@@ -91,7 +100,7 @@ client.on("interactionCreate",async i=>{
     if(i.isButton()){
       if(i.customId==="mute"){s.muted=!s.muted;if(s.muted)s.audio.stop();}
       if(i.customId==="dedicated") return i.reply({content:"Choose the dedicated caller(s):",components:[s.dedicatedMenu()],ephemeral:true}).catch(e=>console.error(e));
-      if(i.customId==="additional_setup") return i.reply({content:`Choose up to ${MAX_ADDITIONAL_CALLERS} additional callers — they get a button in their party chat to call out to every other party:`,components:[s.additionalMenu()],ephemeral:true}).catch(e=>console.error(e));
+      if(i.customId==="additional_setup") return i.reply({content:`Optional: add up to ${MAX_ADDITIONAL_CALLERS} extra callers for this game, on top of everyone with the ${config.additionalCallerRoleName} role. (Choosing here replaces the extras list; pick none to clear it.)`,components:[s.additionalMenu()],ephemeral:true}).catch(e=>console.error(e));
       if(i.customId==="bridge"){
         if(!canBridge(i.member)) return i.reply({content:"Officer/Leader/Admin required.",ephemeral:true}).catch(e=>console.error(e));
         if(s.bridge?.active) s.bridge=null;
@@ -103,7 +112,7 @@ client.on("interactionCreate",async i=>{
         }
       }
       if(i.customId==="stop"){
-        await i.update({content:"Shotcaller stopped.",embeds:[],components:[]}).catch(e=>console.error(e));
+        await i.update({content:"Shotcaller stopped. Empty party channels are deleted now; any with people still in them go as soon as they empty.",embeds:[],components:[]}).catch(e=>console.error(e));
         await s.destroy();sessions.delete(i.guildId);
         return;
       }
@@ -119,7 +128,7 @@ client.on("interactionCreate",async i=>{
 
     if(i.isUserSelectMenu() && i.customId==="additional_select"){
       s.additionalCallers=new Set(i.values);
-      const msg=s.additionalCallers.size?`Additional callers set to ${[...s.additionalCallers].map(id=>`<@${id}>`).join(", ")}.`:"Additional callers cleared.";
+      const msg=s.additionalCallers.size?`Extra callers set to ${[...s.additionalCallers].map(id=>`<@${id}>`).join(", ")}.`:"Extra callers cleared.";
       await i.update({content:msg,components:[]}).catch(e=>console.error(e));
       await s.panelMessage?.edit(s.panel());
       return;
