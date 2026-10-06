@@ -21,6 +21,8 @@ services:
       - BRIDGE_PARTNERS=${BRIDGE_PARTNERS:-}
       - WHISPER_SILENCE_MS=${WHISPER_SILENCE_MS:-700}
       - CALLOUT_AUTO_OFF_MS=${CALLOUT_AUTO_OFF_MS:-20000}
+      - ADDITIONAL_CALLER_ROLE_NAME=${ADDITIONAL_CALLER_ROLE_NAME:-Shotcaller-People}
+      - PARTY_CATEGORY_POSITION=${PARTY_CATEGORY_POSITION:-}
     volumes:
       - /opt/persistent_volume/shotcallerbot/data:/app/data
     healthcheck:
