@@ -32,7 +32,7 @@ class AudioRouter {
   // The dedicated caller goes to every party EXCEPT the one they're standing in — the people there already hear
   // them live. Normally that's the shotcaller's own channel (sourceIndex 0, heard by the main bot), but if the
   // dedicated caller is moved to another party, that party's relay picks them up instead (sourceIndex = its party).
-  broadcast(userId,sourceIndex=0,receiver=this.s.main?.receiver){
+  broadcast(userId,sourceIndex,receiver){
     if(this.s.muted || !userId || !receiver) return;
     if(this.s.dedicated.size && !this.s.dedicated.has(userId)) return;
     const targets=this.s.relays.filter((_,i)=>i!==sourceIndex);

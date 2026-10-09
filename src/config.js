@@ -31,8 +31,6 @@ module.exports = {
   // How long a single additional-caller callout stays open (button press, or a held priority key)
   // before closing itself, so a callout can never turn into a continuous open line.
   calloutAutoOffMs: Number(process.env.CALLOUT_AUTO_OFF_MS || process.env.WHISPER_AUTO_OFF_MS || 20000),
-  // Shared secret for the HTTP control API (status/stop/mute/dedicated/extra-callers), used by an external
-  // control panel such as Guild Hall. Sent as "Authorization: Bearer <key>". Leave unset to keep the control
-  // API fully disabled - the health check keeps working either way.
+  // Shared secret for the HTTP control API used by Guild Hall. Blank = control API disabled.
   controlApiKey: process.env.CONTROL_API_KEY || ""
 };
