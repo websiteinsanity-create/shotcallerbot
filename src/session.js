@@ -244,7 +244,15 @@ class Session {
   async destroy(){
     for(const m of [this.calloutTimers,this.priorityTimers]) for(const t of m.values()) clearTimeout(t);
     this.audio?.stop();
-    this.relays.forEach(r=>r.destroy());
+    // Leave one at a time with a short gap, not all at once: every departure makes the people still in the
+    // channel re-key their encrypted voice session, and a burst of them can leave a user's client stuck sending
+    // audio nobody can decrypt (they'd have to leave and rejoin to be heard). Party 1's relay shares the
+    // shotcaller's channel, so it goes last.
+    const order=[...this.relays.slice(1),...this.relays.slice(0,1)];
+    for(let k=0;k<order.length;k++){
+      try{ order[k].destroy(); }catch(e){ console.warn("[relay] error while leaving:",e.message); }
+      if(k<order.length-1) await new Promise(r=>setTimeout(r,350));
+    }
     // Empty channels are deleted now. Ones with people still in them are left alone (nobody gets kicked) and
     // deleted by the janitor the moment they empty.
     for(const c of this.createdChannels) await janitor.retire(c);
