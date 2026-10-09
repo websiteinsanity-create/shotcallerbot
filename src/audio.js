@@ -29,20 +29,21 @@ class AudioRouter {
     this.additionalStreams=new Map(); // userId -> live subscription
   }
 
-  // The primary caller, heard from the shotcaller's own channel, goes to every party EXCEPT that
-  // channel (relays[0]) — the people there already hear the caller live.
-  broadcast(userId){
-    if(this.s.muted || !userId) return;
+  // The dedicated caller goes to every party EXCEPT the one they're standing in — the people there already hear
+  // them live. Normally that's the shotcaller's own channel (sourceIndex 0, heard by the main bot), but if the
+  // dedicated caller is moved to another party, that party's relay picks them up instead (sourceIndex = its party).
+  broadcast(userId,sourceIndex=0,receiver=this.s.main?.receiver){
+    if(this.s.muted || !userId || !receiver) return;
     if(this.s.dedicated.size && !this.s.dedicated.has(userId)) return;
-    const targets=this.s.relays.slice(1);
+    const targets=this.s.relays.filter((_,i)=>i!==sourceIndex);
     if(!targets.length) return;
     // Discord reports a fresh "speaking start" after every pause over ~100ms, even mid-sentence. If we're already
     // relaying this person, carry on with the live stream — it keeps delivering their audio until a real silence.
     // Rebuilding the pipeline on every little pause cuts the tail off what's still queued and leaves a gap.
     if(this.broadcastStream && !this.broadcastStream.destroyed && this.broadcastUser===userId) return;
-    console.log(`[audio] broadcast() starting for ${userId}, parties: ${targets.length}`);
+    console.log(`[audio] broadcast() starting for ${userId} from party ${sourceIndex+1}, to ${targets.length} parties`);
     this.stopBroadcast();
-    const stream=liveSubscribe(this.s.main.receiver,userId,{
+    const stream=liveSubscribe(receiver,userId,{
       end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
     });
     this.broadcastStream=stream; this.broadcastUser=userId;
