@@ -1,35 +1,67 @@
+# Guild Hall - self-hosted guild manager for Throne and Liberty.
+#
+# Settings live in a file called ".env" next to this compose file (copy .env.example to .env and fill it in).
+# docker compose reads that file by itself and fills in the ${...} placeholders below - no env_file: line needed.
+#
+# Two ways to get the image, pick ONE "guild-hall" service below (comment out the other):
+#   A) build it yourself from this checkout (matches how you run your other bots)
+#   B) pull the image GitHub Actions already built and published on every push to main
+#
+# Either way:  docker compose up -d
+
 services:
-  shotcaller:
+  guild-hall:
     build:
       context: .
       dockerfile: Dockerfile
     pull_policy: build
-    image: shotcaller:latest
-    container_name: shotcaller
+    image: guild-hall:latest
+    # ---- Option B instead of the "build" block above: use the prebuilt image from GitHub ----
+    # image: ghcr.io/YOUR-GITHUB-NAME/guild-hall:latest   # lower-case GitHub user/org name
+    # (if that repository is private: docker login ghcr.io  with a personal access token that has read:packages)
+    container_name: guild-hall
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "${PORT:-3000}:${PORT:-3000}"
     environment:
-      - MAIN_BOT_TOKEN=${MAIN_BOT_TOKEN}
-      - CLIENT_ID=${CLIENT_ID}
-      - RELAY_BOT_TOKENS=${RELAY_BOT_TOKENS}
-      - DEV_GUILD_ID=${DEV_GUILD_ID:-}
-      - PORT=${PORT:-8787}
-      - SHOTCALLER_ROLE_NAME=${SHOTCALLER_ROLE_NAME:-Shotcaller}
-      - OFFICER_ROLE_NAME=${OFFICER_ROLE_NAME:-Officer}
-      - LEADER_ROLE_NAME=${LEADER_ROLE_NAME:-Leader}
-      - PARTY_CATEGORY_NAME=${PARTY_CATEGORY_NAME:-Shotcaller Parties}
-      - BRIDGE_PARTNERS=${BRIDGE_PARTNERS:-}
-      - WHISPER_SILENCE_MS=${WHISPER_SILENCE_MS:-700}
-      - CALLOUT_AUTO_OFF_MS=${CALLOUT_AUTO_OFF_MS:-20000}
-      - ADDITIONAL_CALLER_ROLE_NAME=${ADDITIONAL_CALLER_ROLE_NAME:-Shotcaller-People}
-      - PARTY_CATEGORY_POSITION=${PARTY_CATEGORY_POSITION:-}
-      - PARTY_PLACEMENT=${PARTY_PLACEMENT:-inplace}
-      - CONTROL_API_KEY=${CONTROL_API_KEY:-}
+      # Where players open the app in their browser. No slash at the end. Use https:// once it is on the internet.
+      - PUBLIC_URL=${PUBLIC_URL:-http://localhost:3000}
+      - PORT=${PORT:-3000}
+      # Which network address to listen on inside the container. Leave empty (the default) unless you know you need it.
+      - LISTEN_HOST=${LISTEN_HOST:-}
+      # Discord Developer Portal > your application > OAuth2
+      - DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}
+      - DISCORD_CLIENT_SECRET=${DISCORD_CLIENT_SECRET:-}
+      # Discord Developer Portal > your application > Bot > Reset Token. Used to send direct messages (PINs and reminders).
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      # Your Discord server: only its members can sign in.
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID:-}
+      # Who is an officer: people with one of these roles (comma separated role ids) ...
+      - DISCORD_OFFICER_ROLE_IDS=${DISCORD_OFFICER_ROLE_IDS:-}
+      # ... and/or these people (comma separated Discord user ids). Put yourself here so you can get in the first time.
+      - DISCORD_OFFICER_USER_IDS=${DISCORD_OFFICER_USER_IDS:-}
+      # Optional: only people who also have this role may sign in.
+      - DISCORD_MEMBER_ROLE_ID=${DISCORD_MEMBER_ROLE_ID:-}
+      # Without any DISCORD_* settings above, the app falls back to these shared passcodes (demo mode: fine on your
+      # own PC, never on the internet). Change them if you use demo mode for anything but a quick local look.
+      - MEMBER_PASSCODE=${MEMBER_PASSCODE:-guild}
+      - OFFICER_PASSCODE=${OFFICER_PASSCODE:-officer}
+      # Optional: live control panel for a separate, self-hosted Shotcaller bot. Both have to be set to turn it
+      # on - DISCORD_GUILD_ID above is reused. See .env.example for how to fill these in.
+      - SHOTCALLER_URL=${SHOTCALLER_URL:-}
+      - SHOTCALLER_API_KEY=${SHOTCALLER_API_KEY:-}
     volumes:
-      - /opt/persistent_volume/shotcallerbot/data:/app/data
+      - /opt/persistent_volume/guildhub/data:/data
+    # Lets this container resolve host.docker.internal, needed to reach the Shotcaller bot when it runs with
+    # network_mode: host (a normal bridge-networked service otherwise cannot see a host-networked one by name).
+    # Harmless to leave in even if Shotcaller is not set up.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
     healthcheck:
       test: ["CMD", "node", "-e",
-             "require('http').get('http://localhost:' + (process.env.PORT || 8787) + '/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+             "require('http').get('http://localhost:' + (process.env.PORT || 3000) + '/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -39,3 +71,7 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Optional: checks every 5 minutes whether GitHub published a newer image and restarts the app with it.
+  # Only useful with Option B (a "image:" pulled from ghcr.io) - it has nothing to pull when you build locally.
+  # Remove this block if you prefer to update by hand with:  docker compose pull && docker compose up -
