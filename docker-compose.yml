@@ -24,6 +24,7 @@ services:
       - ADDITIONAL_CALLER_ROLE_NAME=${ADDITIONAL_CALLER_ROLE_NAME:-Shotcaller-People}
       - PARTY_CATEGORY_POSITION=${PARTY_CATEGORY_POSITION:-}
       - PARTY_PLACEMENT=${PARTY_PLACEMENT:-inplace}
+      - CONTROL_API_KEY=${CONTROL_API_KEY:-}
     volumes:
       - /opt/persistent_volume/shotcallerbot/data:/app/data
     healthcheck:

@@ -14,14 +14,19 @@ const janitor = require("./janitor");
 const MAX_ADDITIONAL_CALLERS=16;
 
 class Session {
-  constructor(guild, member, count) {
-    this.guild=guild; this.commandVoice=member.voice.channel; this.count=count;
+  // channel: the voice channel that becomes Party 1 ("commandVoice") - the Discord command passes whoever ran
+  // it is already standing in (i.member.voice.channel); the HTTP control API passes one picked explicitly,
+  // since nobody is "standing" anywhere when a session is started from a web panel instead of Discord.
+  // callerId: the dedicated caller to start with, or null/undefined for none. The Discord command passes
+  // whoever ran it (unchanged behaviour); the HTTP API passes whatever Guild Hall's own "Shotcaller" picker
+  // was explicitly set to - a caller is never inferred, only ever asked for.
+  constructor(guild, channel, callerId, count) {
+    this.guild=guild; this.commandVoice=channel; this.count=count;
     // channels[0] is the shotcaller's own channel ("Party 1") — never created or deleted by the bot.
     // createdChannels holds the bot-made Party 2..N channels, deleted on stop if empty.
     // relays[j] is the relay bot sitting in channels[j] — one per party, Party 1 included.
     this.channels=[]; this.createdChannels=[]; this.relays=[]; this.muted=false;
-    // Whoever runs /shotcaller start is the primary caller by default (adjustable with the Dedicated button).
-    this.dedicated=new Set([member.id]);
+    this.dedicated=callerId?new Set([callerId]):new Set();
     // Additional callers (up to MAX_ADDITIONAL_CALLERS): can push a time-limited callout from ANY party out to every other party.
     // Anyone with the configured role is an additional caller automatically (see isAdditionalCaller);
     // this set is just optional per-game extras on top of that.
@@ -73,13 +78,22 @@ class Session {
     }
 
     this.audio=new AudioRouter(this);
-    this.main.receiver.speaking.on("start",u=>this.audio.broadcast(u));
+    this.wireReceivers();
+  }
 
-    // Every relay also listens to its own party, so an additional caller is picked up wherever they stand.
+  // Who is listened to where:
+  //  - the main bot listens to the shotcaller's own channel (party 1) and relays the dedicated caller from there;
+  //  - every relay listens to its own party, so a dedicated caller who has been moved to another party is still
+  //    heard by everyone else, and an additional caller's callout is picked up wherever they stand.
+  wireReceivers(){
+    this.main.receiver.speaking.on("start",u=>this.audio.broadcast(u));
     for(let j=0;j<this.relays.length;j++){
       const receiver=this.relays[j].connection?.receiver;
       if(!receiver) continue;
       receiver.speaking.on("start",userId=>{
+        // Party 1 is the main bot's job (it would otherwise be relayed twice). Elsewhere, only an explicitly chosen
+        // dedicated caller is relayed — with nobody chosen, every party's ordinary chatter must stay in the party.
+        if(j!==0 && this.dedicated.has(userId)) return this.audio.broadcast(userId,j,receiver);
         if(this.additionalCallActive(userId)) this.audio.additionalBroadcast(j,userId,receiver);
       });
     }
@@ -262,7 +276,7 @@ class Session {
     }).join("\n");
     const names=set=>[...set].map(id=>`<@${id}>`).join(", ");
     const e=new EmbedBuilder().setTitle("📣 Shotcaller Panel")
-      .setDescription(`${parties}\n\nAnyone with the **${config.additionalCallerRoleName}** role can call out to every other party (button in each party's chat, ${secs}s).`)
+      .setDescription(`${parties}\n\nDedicated callers are heard by every other party wherever they're standing. Anyone with the **${config.additionalCallerRoleName}** role can also call out to every other party (button in each party's chat, ${secs}s).`)
       .addFields(
         {name:"Audio",value:this.muted?"🔇 Muted":"🔊 Active",inline:true},
         {name:"Dedicated",value:this.dedicated.size?names(this.dedicated):"Off (anyone)",inline:true},

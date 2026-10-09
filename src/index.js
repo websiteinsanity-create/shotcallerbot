@@ -8,6 +8,8 @@ const config=require("./config");
 const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
 const janitor=require("./janitor");
 const {canUse,canBridge}=require("./permissions");
+const {handleApi}=require("./api");
+const lastchannel=require("./lastchannel");
 
 if(!config.mainToken||!config.clientId) throw new Error("Set MAIN_BOT_TOKEN and CLIENT_ID in .env");
 
@@ -167,7 +169,8 @@ async function startSession(i,count,bridge){
   }
   let s=null;
   try{
-    s=new Session(i.guild,i.member,count);
+    s=new Session(i.guild,i.member.voice.channel,i.member.id,count);
+    lastchannel.remember(i.guildId,i.member.voice.channel);
     await s.start();
     if(bridge)s.bridge={active:false,partnerGuildId:config.bridgePartners.get(i.guildId)||null};
     sessions.set(i.guildId,s);
@@ -186,7 +189,14 @@ http.createServer((req,res)=>{
     res.writeHead(200,{"content-type":"text/plain"});
     return res.end("Shotcaller OK\n");
   }
-  res.writeHead(404);res.end();
-}).listen(config.port,()=>console.log(`Health endpoint on :${config.port}`));
+  handleApi(req,res,sessions,client).then(handled=>{
+    if(handled) return;
+    res.writeHead(404);res.end();
+  }).catch(e=>{
+    console.error("[api] unhandled error:",e);
+    if(!res.headersSent) res.writeHead(500);
+    res.end();
+  });
+}).listen(config.port,()=>console.log(`Health endpoint on :${config.port}${config.controlApiKey?" (control API enabled)":" (control API disabled - set CONTROL_API_KEY to enable)"}`));
 
 client.login(config.mainToken);
