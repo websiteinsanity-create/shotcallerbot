@@ -3,22 +3,29 @@ const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   UserSelectMenuBuilder
 } = require("discord.js");
+const { joinVoiceChannel } = require("@discordjs/voice");
 const config = require("./config");
 const { Relay } = require("./relay");
 const { AudioRouter } = require("./audio");
+const { watchSpeakingFlags } = require("./speakingflags");
 const janitor = require("./janitor");
 
 // Discord's user-select menu allows at most 25 choices, so this can go up to 25.
 const MAX_ADDITIONAL_CALLERS=16;
 
 class Session {
+  // channel: the voice channel that becomes Party 1 ("commandVoice") - the Discord command passes whoever ran
+  // it is already standing in (i.member.voice.channel); the HTTP control API passes one picked explicitly,
+  // since nobody is "standing" anywhere when a session is started from a web panel instead of Discord.
+  // callerId: the dedicated caller to start with, or null/undefined for none. The Discord command passes
+  // whoever ran it (unchanged behaviour); the HTTP API passes whatever Guild Hall's own "Shotcaller" picker
+  // was explicitly set to - a caller is never inferred, only ever asked for.
   constructor(guild, channel, callerId, count) {
     this.guild=guild; this.commandVoice=channel; this.count=count;
     // channels[0] is the shotcaller's own channel ("Party 1") — never created or deleted by the bot.
     // createdChannels holds the bot-made Party 2..N channels, deleted on stop if empty.
     // relays[j] is the relay bot sitting in channels[j] — one per party, Party 1 included.
     this.channels=[]; this.createdChannels=[]; this.relays=[]; this.muted=false;
-    // Whoever runs /shotcaller start is the primary caller by default (adjustable with the Dedicated button).
     this.dedicated=callerId?new Set([callerId]):new Set();
     // Additional callers (up to MAX_ADDITIONAL_CALLERS): can push a time-limited callout from ANY party out to every other party.
     // Anyone with the configured role is an additional caller automatically (see isAdditionalCaller);
@@ -27,7 +34,7 @@ class Session {
     this.callerRoleId=null; this.fetchingMembers=new Set();
     this.calloutOpen=new Map(); this.calloutTimers=new Map();   // button window: userId -> bool / timer
     this.priorityHeld=new Map(); this.priorityTimers=new Map(); // held Push to Talk (Priority) key
-    this.bridge=null; this.panelMessage=null;
+    this.bridge=null; this.panelMessage=null; this.main=null;
     this.config=config; this.audio=null;
   }
 
@@ -53,8 +60,16 @@ class Session {
       }).catch(()=>{});
     }
 
-    // The main bot no longer joins voice: the relay in the shotcaller's own channel (party 1) listens there, so only
-    // one bot sits in each channel. The main bot just runs the slash command and the panel.
+    this.main=joinVoiceChannel({
+      channelId:this.commandVoice.id,guildId:this.guild.id,
+      adapterCreator:this.guild.voiceAdapterCreator,selfDeaf:false,selfMute:false,
+      group:"shotcaller-main"
+    });
+    this.main.on("error",e=>console.error("[main] connection error:",e));
+    this.main.on("stateChange",(oldS,newS)=>console.log(`[main] connection: ${oldS.status} -> ${newS.status}`));
+    watchSpeakingFlags(this.main,"main",(u,f)=>this.onSpeakingFlags(u,f));
+    console.log(`[main] connected to "${this.commandVoice.name}", initial status: ${this.main.state.status}`);
+
     for(let j=0;j<this.channels.length;j++){
       const relay=new Relay(config.relayTokens[j],j,{onFlags:(u,f)=>this.onSpeakingFlags(u,f)});
       this.relays.push(relay); // registered first, so destroy() cleans it up even if login/connect fails
@@ -66,18 +81,19 @@ class Session {
     this.wireReceivers();
   }
 
-  // Who is listened to where: every relay listens to its own party (party 1's relay sits in the shotcaller's channel).
-  //  - party 1: the dedicated caller is relayed to everyone else; with nobody dedicated, anyone in party 1 is.
-  //  - other parties: only an explicitly chosen dedicated caller is relayed (so ordinary party chatter stays put),
-  //    which lets a dedicated caller who has been moved to another party still be heard by everyone.
-  //  - an additional caller's callout is picked up wherever they stand.
+  // Who is listened to where:
+  //  - the main bot listens to the shotcaller's own channel (party 1) and relays the dedicated caller from there;
+  //  - every relay listens to its own party, so a dedicated caller who has been moved to another party is still
+  //    heard by everyone else, and an additional caller's callout is picked up wherever they stand.
   wireReceivers(){
+    this.main.receiver.speaking.on("start",u=>this.audio.broadcast(u));
     for(let j=0;j<this.relays.length;j++){
       const receiver=this.relays[j].connection?.receiver;
       if(!receiver) continue;
       receiver.speaking.on("start",userId=>{
-        const asCaller = j===0 ? (this.dedicated.size===0 || this.dedicated.has(userId)) : this.dedicated.has(userId);
-        if(asCaller) return this.audio.broadcast(userId,j,receiver);
+        // Party 1 is the main bot's job (it would otherwise be relayed twice). Elsewhere, only an explicitly chosen
+        // dedicated caller is relayed — with nobody chosen, every party's ordinary chatter must stay in the party.
+        if(j!==0 && this.dedicated.has(userId)) return this.audio.broadcast(userId,j,receiver);
         if(this.additionalCallActive(userId)) this.audio.additionalBroadcast(j,userId,receiver);
       });
     }
@@ -244,15 +260,8 @@ class Session {
   async destroy(){
     for(const m of [this.calloutTimers,this.priorityTimers]) for(const t of m.values()) clearTimeout(t);
     this.audio?.stop();
-    // Leave one at a time with a short gap, not all at once: every departure makes the people still in the
-    // channel re-key their encrypted voice session, and a burst of them can leave a user's client stuck sending
-    // audio nobody can decrypt (they'd have to leave and rejoin to be heard). Party 1's relay shares the
-    // shotcaller's channel, so it goes last.
-    const order=[...this.relays.slice(1),...this.relays.slice(0,1)];
-    for(let k=0;k<order.length;k++){
-      try{ order[k].destroy(); }catch(e){ console.warn("[relay] error while leaving:",e.message); }
-      if(k<order.length-1) await new Promise(r=>setTimeout(r,350));
-    }
+    this.relays.forEach(r=>r.destroy());
+    try{this.main?.destroy()}catch{}
     // Empty channels are deleted now. Ones with people still in them are left alone (nobody gets kicked) and
     // deleted by the janitor the moment they empty.
     for(const c of this.createdChannels) await janitor.retire(c);
