@@ -43,6 +43,27 @@ function authorized(req) {
 
 // The session's control-panel-facing shape: plain JSON-safe data, no Discord.js objects. Kept separate
 // from Session#panel() (which builds a Discord embed) so a change to one can't silently break the other.
+//
+// connectedUserIds/connectedStates (alongside the existing `connected` count): who, not just how many, is
+// a non-bot member of that party's voice channel right now. `channel.members` is discord.js's own live view
+// (kept current by the gateway's voice-state events, not polled), so this is exact at the moment it's read.
+// Added for Guild Hall's voice-presence attendance tracking - it already knows each player's Discord id
+// (that's what "owner" already is on its side), so handing back the ids themselves is what lets it match
+// "this person is in Party 2's channel" to "this character belongs to that person" without this bot needing
+// to know anything about characters, parties-as-Guild-Hall-knows-them, or attendance at all.
+// connectedStates adds each of those same people's own mute/deaf state (`.voice.mute`/`.voice.deaf` are
+// discord.js's already-combined self-OR-server booleans) - Guild Hall's own "don't count someone fully
+// muted" setting needs that, and would otherwise have no way to tell a player just listening along without
+// a mic from one who's actually AFK with voice chat closed entirely. Kept alongside `connected`/
+// `connectedUserIds`, not replacing them, so anything reading just those is unaffected.
+function presenceOf(channel) {
+  const humans = channel && channel.members ? [...channel.members.values()].filter((m) => !m.user?.bot) : [];
+  return {
+    connected: humans.length,
+    connectedUserIds: humans.map((m) => m.id),
+    connectedStates: humans.map((m) => ({ id: m.id, mute: !!m.voice.mute, deaf: !!m.voice.deaf })),
+  };
+}
 function sessionStatus(s) {
   const names = (set) => [...set];
   return {
@@ -52,12 +73,7 @@ function sessionStatus(s) {
     additionalCallers: names(s.additionalCallers),
     callerRoleId: s.callerRoleId,
     bridge: s.bridge ? { active: !!s.bridge.active, partnerGuildId: s.bridge.partnerGuildId || null } : null,
-    parties: s.channels.map((c, i) => ({
-      index: i + 1,
-      channelId: c.id,
-      name: c.name,
-      connected: c.members ? [...c.members.values()].filter((m) => !m.user?.bot).length : 0,
-    })),
+    parties: s.channels.map((c, i) => ({ index: i + 1, channelId: c.id, name: c.name, ...presenceOf(c) })),
   };
 }
 
@@ -77,6 +93,28 @@ async function handleApi(req, res, sessions, client) {
       .filter((c) => c.type === ChannelType.GuildVoice)
       .sort((a, b) => a.rawPosition - b.rawPosition)
       .map((c) => ({ id: c.id, name: c.name }));
+    send(res, 200, { channels });
+    return true;
+  }
+
+  // Presence for arbitrary voice channels, independent of any session - Guild Hall's "other channels always
+  // tracked" setting (Admin > Events) needs this for channels that are never part of a Shotcaller session at
+  // all (a standing "Main" voice channel, say), so it can't reuse the session-scoped `parties` list above.
+  // ?channels=id1,id2,... ; a channel this bot can't find (wrong id, not a voice channel, bot kicked from it
+  // since it was picked) comes back with found:false rather than failing the whole request - one stale
+  // pick in Guild Hall's list shouldn't stop every other channel from reporting.
+  const vp = /^\/api\/guilds\/(\d{15,25})\/voice-presence\/?$/.exec(url.pathname);
+  if (vp) {
+    if (!authorized(req)) { send(res, 401, { error: "Unauthorized" }); return true; }
+    if (req.method !== "GET") { send(res, 404, { error: "Not found" }); return true; }
+    const guild = client.guilds.cache.get(vp[1]);
+    if (!guild) { send(res, 404, { error: "This bot is not in that server." }); return true; }
+    const ids = (url.searchParams.get("channels") || "").split(",").map((s) => s.trim()).filter(Boolean);
+    const channels = ids.map((id) => {
+      const c = guild.channels.cache.get(id);
+      if (!c || c.type !== ChannelType.GuildVoice) return { channelId: id, found: false, connected: 0, connectedUserIds: [], connectedStates: [] };
+      return { channelId: id, found: true, ...presenceOf(c) };
+    });
     send(res, 200, { channels });
     return true;
   }
