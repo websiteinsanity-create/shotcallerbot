@@ -7,9 +7,9 @@ const http=require("http");
 const config=require("./config");
 const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
 const janitor=require("./janitor");
-const {canUse,canBridge}=require("./permissions");
 const {handleApi}=require("./api");
 const lastchannel=require("./lastchannel");
+const {canUse,canBridge}=require("./permissions");
 
 if(!config.mainToken||!config.clientId) throw new Error("Set MAIN_BOT_TOKEN and CLIENT_ID in .env");
 
