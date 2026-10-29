@@ -1,6 +1,6 @@
 {
   "name": "shotcaller-final-release",
-  "version": "4.1.2",
+  "version": "4.3.3",
   "private": true,
   "description": "Self-hosted Discord Shotcaller with party relays, whisper routing, music and bridge controls.",
   "main": "src/index.js",
@@ -8,7 +8,8 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
     "check": "node --check src/index.js",
-    "check-tokens": "node check-tokens.js"
+    "check-tokens": "node check-tokens.js",
+    "test": "node --test test/*.cjs"
   },
   "engines": {
     "node": ">=20.11.0"

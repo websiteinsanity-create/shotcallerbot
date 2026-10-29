@@ -118,12 +118,14 @@ class Relay {
     this.voicePlayer.play(createAudioResource(stream,{inputType:StreamType.Opus}));
   }
 
-  destroy(){
-    this.voicePlayer.stop(true);
-    try { this.connection?.destroy(); } catch {}
+  async destroy(){
+    const errors=[];
+    try { this.voicePlayer.stop(true); } catch(e) { errors.push(e); }
+    try { this.connection?.destroy(); } catch(e) { errors.push(e); }
     this.connection = null;
-    // Log the relay out too — otherwise every start/stop cycle leaves another live gateway session behind.
-    try { this.client.destroy(); } catch {}
+    // Wait for gateway logout too, while all voice/audio shutdown above stays immediate.
+    try { await this.client.destroy(); } catch(e) { errors.push(e); }
+    if(errors.length)throw new AggregateError(errors,'Relay cleanup failed.');
   }
 }
 module.exports = { Relay };
