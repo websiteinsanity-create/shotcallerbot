@@ -7,9 +7,10 @@ const http=require("http");
 const config=require("./config");
 const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
 const janitor=require("./janitor");
+const {canUse,canBridge}=require("./permissions");
 const {handleApi}=require("./api");
 const lastchannel=require("./lastchannel");
-const {canUse,canBridge}=require("./permissions");
+const {activeSession,reserveStart,completeStart,stopSession}=require("./lifecycle");
 
 if(!config.mainToken||!config.clientId) throw new Error("Set MAIN_BOT_TOKEN and CLIENT_ID in .env");
 
@@ -53,8 +54,8 @@ client.on("interactionCreate",async i=>{
         const s=sessions.get(i.guildId);
         if(!s) return i.reply({content:"No active Shotcaller session to stop.",ephemeral:true}).catch(e=>console.error(e));
         if(!canUse(i.member)) return i.reply({content:"You need the Shotcaller, Officer, Leader or Administrator permission.",ephemeral:true}).catch(e=>console.error(e));
+        stopSession(sessions,i.guildId,s.sessionId);
         await i.reply({content:"Stopping Shotcaller. Empty party channels are deleted now; any with people still in them are deleted as soon as they empty.",ephemeral:true}).catch(e=>console.error(e));
-        await s.destroy();sessions.delete(i.guildId);
         try{ await s.panelMessage?.edit({content:"Shotcaller stopped.",embeds:[],components:[]}); }catch{}
         return;
       }
@@ -87,7 +88,7 @@ client.on("interactionCreate",async i=>{
       return startSession(i,n,false);
     }
 
-    const s=sessions.get(i.guildId);
+    const s=activeSession(sessions,i.guildId);
     if(!s) return;
 
     if(i.isButton() && i.customId==="callout_toggle"){
@@ -114,8 +115,8 @@ client.on("interactionCreate",async i=>{
         }
       }
       if(i.customId==="stop"){
+        stopSession(sessions,i.guildId,s.sessionId);
         await i.update({content:"Shotcaller stopped. Empty party channels are deleted now; any with people still in them go as soon as they empty.",embeds:[],components:[]}).catch(e=>console.error(e));
-        await s.destroy();sessions.delete(i.guildId);
         return;
       }
     }
@@ -150,37 +151,22 @@ client.on("interactionCreate",async i=>{
 // reject: every Discord API call inside it is individually caught, so it's always safe for a caller
 // to do `return startSession(...)` without awaiting it.
 async function startSession(i,count,bridge){
-  // Hard guard: reserve this guild's session slot immediately, synchronously, before any slow/async
-  // work. Without this, two near-simultaneous start attempts (e.g. a rare Discord gateway hiccup
-  // re-delivering an interaction) could both pass the earlier "already active" check and each spin up
-  // their own independent Session/relay set for the same guild — duplicate relay bots, duplicate
-  // listeners, chaos. Whoever gets here first claims the slot; anyone else bails out immediately.
-  if(sessions.has(i.guildId)){
-    try{ await i.deferUpdate(); }catch{}
-    return;
-  }
-  sessions.set(i.guildId,null); // placeholder, replaced with the real Session once start() finishes
+  let reservation;
   try{
-    await i.deferUpdate();
-  }catch(e){
-    console.error("Could not acknowledge the start interaction in time:",e);
-    sessions.delete(i.guildId);
-    return;
-  }
-  let s=null;
-  try{
-    s=new Session(i.guild,i.member.voice.channel,i.member.id,count);
-    lastchannel.remember(i.guildId,i.member.voice.channel);
-    await s.start();
+    if(!canUse(i.member) || !i.member.voice.channel)throw Error('Join a voice channel with Shotcaller permission first.');
+    reservation=reserveStart(sessions,i.guildId);
+    const s=await completeStart(sessions,i.guildId,reservation,async()=>{
+      await i.deferUpdate();
+      return new Session(i.guild,i.member.voice.channel,i.member.id,count);
+    });
     if(bridge)s.bridge={active:false,partnerGuildId:config.bridgePartners.get(i.guildId)||null};
-    sessions.set(i.guildId,s);
-    s.panelMessage=await i.channel.send(s.panel());
-    await i.editReply({content:"Shotcaller started.",components:[]}).catch(e=>console.error("Could not confirm the start:",e));
+    lastchannel.remember(i.guildId,i.member.voice.channel);
+    try{s.panelMessage=await i.channel.send(s.panel());}catch(e){console.warn('Could not post Shotcaller panel:',e.message);}
+    if(activeSession(sessions,i.guildId)!==s){try{await s.panelMessage?.edit({content:'Shotcaller stopped.',embeds:[],components:[]});}catch{}return;}
+    await i.editReply({content:'Shotcaller started.',components:[]}).catch(()=>{});
   }catch(e){
-    console.error("Shotcaller failed to start:",e);
-    sessions.delete(i.guildId); // release the reserved slot so a retry isn't permanently blocked
-    try{ await s?.destroy(); }catch(err){ console.error("Cleanup after failed start also failed:",err); } // don't leave half-built channels/relays behind
-    await i.editReply({content:`Could not start Shotcaller: ${e.message}`,components:[]}).catch(err=>console.error("Could not report the start failure:",err));
+    console.error('Shotcaller start failed:',e);
+    try{if(i.deferred || i.replied)await i.editReply({content:`Could not start Shotcaller: ${e.message}`,components:[]});else await i.reply({content:e.message,ephemeral:true});}catch{}
   }
 }
 

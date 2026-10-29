@@ -12,6 +12,8 @@ const { ChannelType } = require("discord.js");
 const config = require("./config");
 const { Session } = require("./session");
 const lastchannel = require("./lastchannel");
+const { diagnosticsFor } = require("./diagnostics");
+const {idOf,reserveStart,completeStart,stopSession}=require("./lifecycle");
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
@@ -41,6 +43,9 @@ function authorized(req) {
   return !!m && m[1] === config.controlApiKey;
 }
 
+// The session's control-panel-facing shape: plain JSON-safe data, no Discord.js objects. Kept separate
+// from Session#panel() (which builds a Discord embed) so a change to one can't silently break the other.
+//
 // connectedUserIds/connectedStates (alongside the existing `connected` count): who, not just how many, is
 // a non-bot member of that party's voice channel right now. `channel.members` is discord.js's own live view
 // (kept current by the gateway's voice-state events, not polled), so this is exact at the moment it's read.
@@ -61,13 +66,13 @@ function presenceOf(channel) {
     connectedStates: humans.map((m) => ({ id: m.id, mute: !!m.voice.mute, deaf: !!m.voice.deaf })),
   };
 }
-
-// The session's control-panel-facing shape: plain JSON-safe data, no Discord.js objects. Kept separate
-// from Session#panel() (which builds a Discord embed) so a change to one can't silently break the other.
-function sessionStatus(s) {
+function sessionStatus(s, client) {
+  if(s.lifecycle)return {active:false,sessionId:idOf(s),sessionState:s.lifecycle,diagnostics:{...diagnosticsFor(null,client,config.relayTokens.length,s.lifecycle==='starting'),sessionState:s.lifecycle}};
   const names = (set) => [...set];
   return {
     active: true,
+    sessionId:idOf(s),sessionState:"active",
+    diagnostics: diagnosticsFor(s, client || s.guild?.client, config.relayTokens.length),
     muted: s.muted,
     dedicated: names(s.dedicated),
     additionalCallers: names(s.additionalCallers),
@@ -130,14 +135,13 @@ async function handleApi(req, res, sessions, client) {
 
   try {
     if (sub === "" && req.method === "GET") {
-      send(res, 200, s ? sessionStatus(s) : { active: false, lastVoiceChannel: lastchannel.get(guildId) });
+      send(res, 200, s ? sessionStatus(s, client) : { active: false, sessionId:null,sessionState:"inactive",lastVoiceChannel: lastchannel.get(guildId), diagnostics: diagnosticsFor(null, client, config.relayTokens.length, sessions.has(guildId)) });
       return true;
     }
 
     if (sub === "/start" && req.method === "POST") {
       // Same guard as the Discord command: one session per guild, whoever claims the (synchronous) slot
-      // first wins. sessions.get can also be the null placeholder a start-in-progress reserves - either
-      // way, something is already happening for this guild.
+      // first wins. Lifecycle records keep the slot reserved through start and teardown.
       if (sessions.has(guildId)) { send(res, 409, { error: "A Shotcaller session is already active." }); return true; }
       const body = await readJsonBody(req);
       const count = Number(body.count);
@@ -146,47 +150,36 @@ async function handleApi(req, res, sessions, client) {
       if (!/^\d{15,25}$/.test(channelId)) { send(res, 400, { error: "channelId must be a Discord voice channel id." }); return true; }
       const guild = client.guilds.cache.get(guildId);
       if (!guild) { send(res, 404, { error: "This bot is not in that server." }); return true; }
-      let channel;
-      try { channel = await guild.channels.fetch(channelId); } catch { channel = null; }
-      if (!channel || channel.type !== ChannelType.GuildVoice) { send(res, 400, { error: "That channel is not a voice channel in this server." }); return true; }
-      const dedicatedCallerId = body.dedicatedCallerId ? String(body.dedicatedCallerId) : null;
-      // Renames for the bot-created channels only (index 1..N, i.e. Party 2 onward) - channel 0 (the anchor,
-      // an existing channel the bot did not create) is deliberately left alone for now. partyNames[0] names
-      // channel index 1, partyNames[1] names channel index 2, and so on.
-      const partyNames = Array.isArray(body.partyNames) ? body.partyNames.map((x) => (x == null ? null : String(x).slice(0, 80))) : [];
-
-      sessions.set(guildId, null); // reserve the slot before any slow/async work, same as the Discord command
-      let s2 = null;
+      // Claim the common Discord/HTTP slot before the asynchronous channel lookup.
+      const reservation=reserveStart(sessions,guildId);
       try {
-        s2 = new Session(guild, channel, dedicatedCallerId, count);
-        await s2.start();
-        for (let i = 1; i < s2.channels.length; i++) {
-          const name = partyNames[i - 1];
-          if (name) await s2.channels[i].setName(name).catch((e) => console.warn(`[api] couldn't rename party ${i + 1}:`, e.message));
-        }
-        sessions.set(guildId, s2);
-        lastchannel.remember(guildId, channel);
-        send(res, 200, sessionStatus(s2));
-      } catch (e) {
-        sessions.delete(guildId);
-        try { await s2?.destroy(); } catch (err) { console.error("[api] cleanup after failed start also failed:", err); }
-        send(res, 502, { error: e.message || "Could not start Shotcaller." });
-      }
+        const s2=await completeStart(sessions,guildId,reservation,async()=>{
+          let channel;try{channel=await guild.channels.fetch(channelId);}catch{}
+          if(!channel || channel.type!==ChannelType.GuildVoice){const e=Error('That channel is not a voice channel in this server.');e.status=400;throw e;}
+          return new Session(guild,channel,body.dedicatedCallerId?String(body.dedicatedCallerId):null,count);
+        });
+        // Optional display renames must not hold session activation or resurrect a stopped session.
+        const names=Array.isArray(body.partyNames)?body.partyNames:[];
+        for(let i=1;i<s2.channels.length;i++)if(names[i-1])s2.channels[i].setName(String(names[i-1]).slice(0,80)).catch(e=>console.warn('[api] party rename failed:',e.message));
+        lastchannel.remember(guildId,s2.commandVoice);
+        send(res,200,sessionStatus(s2,client));
+      }catch(e){send(res,e.status || 502,{error:e.message || 'Could not start Shotcaller.'});}
       return true;
     }
 
-    if (!s) { send(res, 409, { error: "No active Shotcaller session for this guild." }); return true; }
+    if (!s && sub !== "/stop") { send(res, 409, { error: "No active Shotcaller session for this guild." }); return true; }
+    if(s?.lifecycle && sub!=="/stop"){send(res,409,{error:"Session is starting or stopping."});return true;}
 
     if (sub === "/stop" && req.method === "POST") {
-      try { await s.panelMessage?.edit({ content: "Shotcaller stopped.", embeds: [], components: [] }); } catch {}
-      await s.destroy();
-      sessions.delete(guildId);
-      send(res, 200, { ok: true });
+      const body=await readJsonBody(req);
+      if(!s && sessions.has(guildId)){const e=Error('This session changed. Refresh before stopping it.');e.status=409;throw e;}
+      send(res,200,stopSession(sessions,guildId,body.sessionId || idOf(s))); 
       return true;
     }
 
     if (sub === "/mute" && req.method === "POST") {
       const body = await readJsonBody(req);
+      if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       s.muted = typeof body.muted === "boolean" ? body.muted : !s.muted;
       if (s.muted) s.audio.stop();
       await s.panelMessage?.edit(s.panel()).catch(() => {});
@@ -196,6 +189,7 @@ async function handleApi(req, res, sessions, client) {
 
     if (sub === "/dedicated" && req.method === "POST") {
       const body = await readJsonBody(req);
+      if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       if (!Array.isArray(body.userIds)) { send(res, 400, { error: "userIds must be an array of Discord user ids." }); return true; }
       s.dedicated = new Set(body.userIds.map(String));
       s.audio.stopBroadcast(); // same as the dedicated_select menu handler: cut any in-flight broadcast, the new set takes over from the next speech
@@ -206,6 +200,7 @@ async function handleApi(req, res, sessions, client) {
 
     if (sub === "/additional-callers" && req.method === "POST") {
       const body = await readJsonBody(req);
+      if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       if (!Array.isArray(body.userIds)) { send(res, 400, { error: "userIds must be an array of Discord user ids." }); return true; }
       s.additionalCallers = new Set(body.userIds.map(String));
       await s.panelMessage?.edit(s.panel()).catch(() => {});
@@ -222,7 +217,7 @@ async function handleApi(req, res, sessions, client) {
     return true;
   } catch (e) {
     console.error("[api]", req.method, url.pathname, e);
-    send(res, 500, { error: e.message || "Internal error" });
+    send(res, e.status || 500, { error: e.message || "Internal error" });
     return true;
   }
 }
