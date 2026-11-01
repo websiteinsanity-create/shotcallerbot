@@ -1,31 +1,24 @@
-# Shotcaller — Final Release
+# Shotcaller 4.4.1
 
 This package is a self-hosted Discord Shotcaller application.
 
+## Release 4.4.1
+
+Companion GuildHub version: **1.43.24**. Read **DEPLOYMENT_EN.md** before updating both applications.
+
 ## Features
 
-- `/shotcaller start`
-- GvG mode: 8 party channels
-- Full Guild mode: 12 party channels
-- Custom mode: 1–12 party channels
-- Automatically creates/deletes party channels
-- Main Shotcaller voice broadcast to all parties
-- Mute/unmute
-- Dedicated caller
-- Automatic current-speaker selection
-- Party whisper routing:
-  - Party 1: everyone may whisper
-  - Parties 2–12: one configured whisperer per party
-- Whisper routing back to the Shotcaller
-- Whisper setup panel
-- Party identification in the panel
-- Music library
-- Looping FFmpeg playback
-- Music stop/restart controls
-- Bridge request/accept/live-side controls
-- Relay bot reconnection
-- Docker deployment
-- Health endpoint
+- Discord and authenticated GuildHub session controls.
+- Up to twelve party relay bots, including Party 1, with voice-ready checks and cleanup.
+- One optional main caller; authorised PTT-Prio and time-limited Callout button routing.
+- Background main bot, following the main caller into accessible external voice channels when needed.
+- Concurrent caller audio mixing, bounded queues, and source-channel echo exclusion.
+- Pause/Resume and Mute; attendance remains independent of pause.
+- Main-caller unavailable/replacement/wait state shared between GuildHub clients.
+- Voice-presence endpoint for extra-channel attendance, explicit unknown/error results and bounded lookups.
+- Read-only connection and routing telemetry; Docker deployment and health endpoint.
+
+Bridge transport and music playback are not implemented features of this release. Discord audio delivery and end-to-end latency require live verification.
 
 ## What you must provide
 

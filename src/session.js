@@ -3,7 +3,8 @@ const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   UserSelectMenuBuilder
 } = require("discord.js");
-const { joinVoiceChannel } = require("@discordjs/voice");
+const { joinVoiceChannel, entersState, VoiceConnectionStatus, createAudioPlayer, createAudioResource, StreamType } = require("@discordjs/voice");
+const {MainCaller}=require("./main-caller");
 const config = require("./config");
 const { Relay } = require("./relay");
 const { AudioRouter } = require("./audio");
@@ -21,12 +22,13 @@ class Session {
   // whoever ran it (unchanged behaviour); the HTTP API passes whatever Guild Hall's own "Shotcaller" picker
   // was explicitly set to - a caller is never inferred, only ever asked for.
   constructor(guild, channel, callerId, count) {
-    this.guild=guild; this.commandVoice=channel; this.count=count;
+    this.guild=guild; this.commandVoice=channel; this.count=Math.min(12,count);
     // channels[0] is the shotcaller's own channel ("Party 1") — never created or deleted by the bot.
     // createdChannels holds the bot-made Party 2..N channels, deleted on stop if empty.
     // relays[j] is the relay bot sitting in channels[j] — one per party, Party 1 included.
     this.channels=[]; this.createdChannels=[]; this.relays=[]; this.muted=false;
     this.dedicated=callerId?new Set([callerId]):new Set();
+    this.mainCaller=new MainCaller(callerId);this.paused=false;this.followGeneration=0;this.followSignature=null;this.followRetryAt=0;
     // Additional callers (up to MAX_ADDITIONAL_CALLERS): can push a time-limited callout from ANY party out to every other party.
     // Anyone with the configured role is an additional caller automatically (see isAdditionalCaller);
     // this set is just optional per-game extras on top of that.
@@ -42,12 +44,17 @@ class Session {
   ensureStarting(){if(this.startCancelled)throw Error("Session start cancelled.");}
   async start(){
     this.ensureStarting();
+    if(!Number.isInteger(this.count) || this.count<1)throw Error("Choose a positive whole party count.");
     // One relay bot per party, including the shotcaller's own. Check BEFORE creating anything so a
     // shortage of tokens can't leave half-built channels behind.
     if(config.relayTokens.length<this.count){
       throw new Error(`Need one relay bot per party (including your own): ${this.count} parties but only ${config.relayTokens.length} relay token(s) configured.`);
     }
 
+    const tokens=config.relayTokens.slice(0,this.count);
+    if(new Set(tokens).size!==tokens.length || tokens.includes(config.mainToken))throw Error("Main and relay bots must use distinct tokens.");
+    const perms=this.commandVoice.permissionsFor?.(this.guild.members.me);
+    if(perms && !perms.has(PermissionFlagsBits.ViewChannel))throw Error("Main control bot cannot view the selected voice channel.");
     await this.loadCallers();
     this.ensureStarting();
 
@@ -61,51 +68,122 @@ class Session {
     for(const c of this.channels){
       this.ensureStarting();
       await c.send({
-        content:`🎙️ Talk normally with your party here.\nAdditional callers (**${config.additionalCallerRoleName}** role): press the button for a ${secs}-second callout heard by every other party.`,
+        content:`🎙️ Talk normally with your party here.\nAdditional callers (**${config.additionalCallerRoleName}** role): press the button for a ${secs}-second callout to the main caller, or all other parties when no main caller is available.`,
         components:[this.calloutRow()]
       }).catch(()=>{});
     }
 
     this.ensureStarting();
-    this.main=joinVoiceChannel({
-      channelId:this.commandVoice.id,guildId:this.guild.id,
-      adapterCreator:this.guild.voiceAdapterCreator,selfDeaf:false,selfMute:false,
-      group:"shotcaller-main"
-    });
-    this.main.on("error",e=>console.error("[main] connection error:",e));
-    this.main.on("stateChange",(oldS,newS)=>console.log(`[main] connection: ${oldS.status} -> ${newS.status}`));
-    watchSpeakingFlags(this.main,"main",(u,f)=>this.onSpeakingFlags(u,f));
-    console.log(`[main] connected to "${this.commandVoice.name}", initial status: ${this.main.state.status}`);
-
     for(let j=0;j<this.channels.length;j++){
-      const relay=new Relay(config.relayTokens[j],j,{onFlags:(u,f)=>this.onSpeakingFlags(u,f)});
+      const relay=new Relay(config.relayTokens[j],j,{onFlags:(u,f)=>this.onSpeakingFlags(u,f),operation:this.operation,onVoiceState:(index,status,relay)=>this.onRelayState(index,status,relay)});
       this.relays.push(relay); // registered first, so destroy() cleans it up even if login/connect fails
       await relay.login();
+      this.ensureStarting();
+      if(relay.client.user.id===this.guild.client.user.id || this.relays.some(r=>r!==relay && r.client.user?.id===relay.client.user.id))throw Error("Each relay must have a distinct bot identity.");
     this.ensureStarting();
       await relay.connect(this.channels[j].id,this.guild.id);
     this.ensureStarting();
     }
 
+    await Promise.all(this.relays.map(r=>entersState(r.connection,VoiceConnectionStatus.Ready,20000)));
+    this.ensureStarting();
+    if(this.relays.some(r=>r.client.isReady?.()===false || r.connection?.state.status!==VoiceConnectionStatus.Ready))throw Error("Not all relays are ready.");
     this.audio=new AudioRouter(this);
     this.wireReceivers();
+    this.voiceListener=()=>this.syncMainCaller();
+    this.guild.client.on("voiceStateUpdate",this.voiceListener);
+    this.followTimer=setInterval(()=>this.syncMainCaller(),1000);this.followTimer.unref?.();
+    this.syncMainCaller();
   }
 
   // Who is listened to where:
   //  - the main bot listens to the shotcaller's own channel (party 1) and relays the dedicated caller from there;
   //  - every relay listens to its own party, so a dedicated caller who has been moved to another party is still
   //    heard by everyone else, and an additional caller's callout is picked up wherever they stand.
-  wireReceivers(){
-    this.main.receiver.speaking.on("start",u=>this.audio.broadcast(u));
-    for(let j=0;j<this.relays.length;j++){
-      const receiver=this.relays[j].connection?.receiver;
-      if(!receiver) continue;
-      receiver.speaking.on("start",userId=>{
-        // Party 1 is the main bot's job (it would otherwise be relayed twice). Elsewhere, only an explicitly chosen
-        // dedicated caller is relayed — with nobody chosen, every party's ordinary chatter must stay in the party.
-        if(j!==0 && this.dedicated.has(userId)) return this.audio.broadcast(userId,j,receiver);
-        if(this.additionalCallActive(userId)) this.audio.additionalBroadcast(j,userId,receiver);
-      });
+  wireReceiver(index){
+    const receiver=this.relays[index]?.connection?.receiver;
+    if(!receiver || this.wiredReceivers?.has(receiver))return;
+    this.wiredReceivers ||= new WeakSet();this.wiredReceivers.add(receiver);
+    receiver.speaking.on('start',userId=>{
+      const relay=this.relays[index];if(relay?.connection?.receiver!==receiver || relay.connection.state.status!=='ready' || relay.client?.isReady?.()===false)return;
+      if(this.dedicated.has(userId))return this.audio.broadcast(userId,index,receiver);
+      if(this.additionalCallActive(userId))this.audio.additionalBroadcast(index,userId,receiver);
+    });
+  }
+  wireReceivers(){for(let index=0;index<this.relays.length;index++)this.wireReceiver(index);}
+  onRelayState(index,status,relay){
+    if(!this.audio || this.startCancelled)return;
+    if(status!=='ready'){
+      this.audio.dropTarget(relay);this.audio.dropReceiver(relay.connection?.receiver);
+      this.syncMainCaller();this.audio.refreshTargets();return;
     }
+    this.wireReceiver(index);this.syncMainCaller();this.audio.refreshTargets();
+    const receiver=relay.connection?.receiver;
+    for(const user of receiver?.speaking?.users?.keys?.() || []){
+      if(this.dedicated.has(user))this.audio.broadcast(user,index,receiver);
+      else if(this.additionalCallActive(user))this.audio.additionalBroadcast(index,user,receiver);
+    }
+  }
+
+  setDedicated(ids){
+    this.mainCaller.select(ids);this.dedicated=new Set(ids);this.audio?.stopBroadcast();
+    for(const id of ids)this.audio?.stopAdditionalFor(id);
+    this.followSignature=null;this.syncMainCaller();
+  }
+  setPaused(value){
+    this.paused=!!value;this.mainCaller.pause(this.paused);this.audio?.stop();
+    for(const map of [this.calloutTimers,this.priorityTimers]){for(const t of map.values())clearTimeout(t);map.clear();}
+    this.calloutOpen.clear();this.priorityHeld.clear();
+    if(!this.paused){
+      this.syncMainCaller();
+      const user=this.mainCaller.id;
+      for(let i=0;i<this.relays.length;i++){const receiver=this.relays[i].connection?.receiver;if(user && receiver?.speaking?.users?.has(user))this.audio?.broadcast(user,i,receiver);}
+      if(user && this.main?.receiver?.speaking?.users?.has(user))this.audio?.broadcast(user,-1,this.main.receiver);
+    }
+  }
+  syncMainCaller(){
+    if(this.startCancelled || this.paused)return;
+    const id=this.mainCaller.id;
+    const voice=id?(this.guild.voiceStates?.cache.get(id) || this.guild.members.cache.get(id)?.voice):null;
+    const channelId=voice?.channelId || null;
+    const index=this.channels.findIndex(c=>c.id===channelId);
+    const managed=index>=0;
+    const signature=(id || '')+':'+(channelId || '');
+    const ready=managed?(this.relays[index]?.connection?.state.status==='ready' && this.relays[index]?.client?.isReady?.()!==false):this.mainChannelId===channelId && this.main?.state.status==='ready';
+    this.mainCaller.observe(channelId,!!ready,this.followError || null);
+    if(signature===this.followSignature && (managed || !channelId || ready || this.followPending || Date.now()<this.followRetryAt))return;
+    this.followSignature=signature;this.followRetryAt=Date.now()+5000;
+    const generation=++this.followGeneration;this.followPending=false;
+    this.audio?.stopBroadcast();this.audio?.dropTarget(this.followTarget);this.followPlayer?.stop(true);const previousMain=this.main;this.main=null;try{previousMain?.destroy();}catch{}
+    this.main=null;this.mainChannelId=null;this.followTarget=null;this.followError=null;
+    this.audio?.refreshTargets();
+    if(!id || !channelId || managed)return;
+    this.followPending=true;
+    this.followMain(channelId,generation).catch(error=>{
+      if(generation!==this.followGeneration || this.startCancelled)return;
+      this.followError=error.message;this.mainCaller.observe(channelId,false,error.message);
+      try{this.main?.destroy();}catch{}this.main=null;this.mainChannelId=null;this.followTarget=null;
+      console.warn('[main-follow] failed:',error.message);
+    }).finally(()=>{if(generation===this.followGeneration)this.followPending=false;});
+  }
+  async followMain(channelId,generation){
+    let timer;let channel;
+    try{channel=this.guild.channels.cache.get(channelId) || await Promise.race([this.guild.channels.fetch(channelId),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error("Main caller channel lookup timed out.")),3000);})]);}finally{clearTimeout(timer);}
+    if(generation!==this.followGeneration || this.startCancelled || this.paused)return;
+    if(!channel || channel.type!==ChannelType.GuildVoice)throw Error('Main caller is not in an accessible voice channel.');
+    const permissions=channel.permissionsFor?.(this.guild.members.me);
+    if(permissions && !permissions.has([PermissionFlagsBits.ViewChannel,PermissionFlagsBits.Connect,PermissionFlagsBits.Speak]))throw Error('Main bot cannot view, connect or speak in the main caller channel.');
+    const conn=joinVoiceChannel({channelId,guildId:this.guild.id,adapterCreator:this.guild.voiceAdapterCreator,selfDeaf:false,selfMute:false,group:'shotcaller-main'});
+    this.main=conn;this.mainChannelId=channelId;
+    conn.on('error',error=>this.operation?.event('main.follow.error',{channelId,error}));
+    conn.on('stateChange',(_old,next)=>{if(this.startCancelled || this.main!==conn)return;this.operation?.event('main.follow.state',{channelId,from:_old.status,to:next.status});if(next.status!=='ready'){this.followPlayer?.stop(true);this.audio?.dropTarget(this.followTarget);this.audio?.dropReceiver(conn.receiver);this.mainCaller.observe(channelId,false);this.audio?.refreshTargets();}});
+    if(!this.followPlayer){this.followPlayer=createAudioPlayer();this.followPlayer.on('error',error=>console.error('[main-follow] audio:',error.message));}
+    conn.subscribe(this.followPlayer);
+    await entersState(conn,VoiceConnectionStatus.Ready,20000);
+    if(generation!==this.followGeneration || this.startCancelled){try{conn.destroy();}catch{}return;}
+    this.followTarget={playOpus:stream=>{if(this.paused || this.main!==conn || conn.state.status!=='ready'){stream.destroy();return;}this.followPlayer.play(createAudioResource(stream,{inputType:StreamType.Opus}));}};
+    conn.receiver.speaking.on('start',user=>{if(this.main===conn && this.dedicated.has(user))this.audio.broadcast(user,-1,conn.receiver);});
+    this.mainCaller.observe(channelId,true);this.audio?.refreshTargets();
   }
 
   // Creates Party 2..N. Where they go depends on PARTY_PLACEMENT:
@@ -132,7 +210,9 @@ class Session {
 
     for(let i=1;i<this.count;i++){
       this.ensureStarting();
+      const began=Date.now();
       const c=await this.makePartyChannel(`Party ${i+1}`,parentId,overwrites);
+      this.operation?.event("channel.created",{channelId:c.id,relay:i+1,durationMs:Date.now()-began});
       janitor.track(c); // remembered on disk straight away, so cleanup can still find it after a restart
       this.channels.push(c);
       this.createdChannels.push(c);
@@ -190,7 +270,7 @@ class Session {
 
   // Is this person allowed to be heard by everyone right now? (button window open, or priority key held)
   additionalCallActive(userId){
-    if(!this.isAdditionalCaller(userId)) return false;
+    if(this.paused || !this.isAdditionalCaller(userId)) return false;
     if(this.dedicated.has(userId)) return false; // the primary caller is already handled by the main broadcast
     return this.calloutOpen.get(userId)===true || this.priorityHeld.get(userId)===true;
   }
@@ -211,7 +291,7 @@ class Session {
 
   // Button: opens a window of calloutAutoOffMs, closes itself, or click again to close early.
   toggleCallout(userId){
-    if(!this.isAdditionalCaller(userId)) return null; // caller shows the "not authorised" message
+    if(this.paused || !this.isAdditionalCaller(userId)) return null; // caller shows the "not authorised" message
     clearTimeout(this.calloutTimers.get(userId));
     const next=!(this.calloutOpen.get(userId)===true);
     this.calloutOpen.set(userId,next);
@@ -231,7 +311,8 @@ class Session {
   // "Push to Talk (Priority)" keybind should set — held key = open line, released = closed.
   // (Unverified until the [flags] log lines have been checked against a real key press.)
   onSpeakingFlags(userId,flags){
-    if(!this.isAdditionalCaller(userId)) return;
+    this.lastPrioritySignal={at:Date.now(),userId,flags:Number(flags),authorised:this.isAdditionalCaller(userId),paused:this.paused};
+    if(this.paused || !this.isAdditionalCaller(userId)) return;
     const held=(Number(flags)&4)!==0;
     if(held===(this.priorityHeld.get(userId)===true)) return;
     clearTimeout(this.priorityTimers.get(userId));
@@ -252,7 +333,7 @@ class Session {
   calloutRow(){
     const secs=Math.round(this.config.calloutAutoOffMs/1000);
     return new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setCustomId("callout_toggle").setLabel(`📢 Callout to Everyone (${secs}s)`).setStyle(ButtonStyle.Success)
+      new ButtonBuilder().setCustomId("callout_toggle").setLabel(`📢 Callout (${secs}s)`).setStyle(ButtonStyle.Success)
     );
   }
 
@@ -264,12 +345,14 @@ class Session {
 
   dedicatedMenu(){
     return new ActionRowBuilder().addComponents(
-      new UserSelectMenuBuilder().setCustomId("dedicated_select").setPlaceholder("Pick dedicated caller(s) — select none to clear").setMinValues(0).setMaxValues(10)
+      new UserSelectMenuBuilder().setCustomId("dedicated_select").setPlaceholder("Pick one main caller — select none to clear").setMinValues(0).setMaxValues(1)
     );
   }
 
   async destroy(){
     this.startCancelled=true;
+    clearInterval(this.followTimer);if(this.voiceListener)this.guild.client.removeListener("voiceStateUpdate",this.voiceListener);this.followGeneration++;
+    this.followPlayer?.stop(true);
     for(const m of [this.calloutTimers,this.priorityTimers]) for(const t of m.values()) clearTimeout(t);
     const errors=[],pending=[];
     try{this.audio?.stop();}catch(e){errors.push(e);}
@@ -291,10 +374,10 @@ class Session {
     }).join("\n");
     const names=set=>[...set].map(id=>`<@${id}>`).join(", ");
     const e=new EmbedBuilder().setTitle("📣 Shotcaller Panel")
-      .setDescription(`${parties}\n\nDedicated callers are heard by every other party wherever they're standing. Anyone with the **${config.additionalCallerRoleName}** role can also call out to every other party (button in each party's chat, ${secs}s).`)
+      .setDescription(`${parties}\n\nThe main caller is heard by every other party. Anyone with the **${config.additionalCallerRoleName}** role can call out to the main caller, or all other parties when the main caller is unavailable (button in each party's chat, ${secs}s).`)
       .addFields(
         {name:"Audio",value:this.muted?"🔇 Muted":"🔊 Active",inline:true},
-        {name:"Dedicated",value:this.dedicated.size?names(this.dedicated):"Off (anyone)",inline:true},
+        {name:"Dedicated",value:this.dedicated.size?names(this.dedicated):"None (PTT-Prio to all parties)",inline:true},
         {name:"Additional callers",value:[this.callerRoleId?`<@&${this.callerRoleId}> role`:`⚠️ role "${config.additionalCallerRoleName}" not found`,...(this.additionalCallers.size?[`+ extras: ${names(this.additionalCallers)}`]:[])].join("\n"),inline:true},
         {name:"Bridge",value:this.bridge?.active?"Active":"Off",inline:true}
       );

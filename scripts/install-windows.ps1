@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 Write-Host "=== Shotcaller Installer ==="
 if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
-  Write-Host "Node.js 20+ is required. Install it from https://nodejs.org/ and rerun this script."
+  Write-Host "Node.js 22.12 or newer is required. Install it from https://nodejs.org/ and rerun this script."
   exit 1
 }
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {

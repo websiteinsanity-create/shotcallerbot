@@ -1,102 +1,45 @@
-const { EndBehaviorType } = require("@discordjs/voice");
-const { PassThrough } = require("stream");
-
-// The relays' players expect every read to return exactly ONE Opus packet. A plain (byte-mode) PassThrough
-// glues together whatever has piled up between two 20ms player ticks, so two packets come out as one
-// malformed blob — which listeners hear as robotic, compressed, glitchy audio. Object mode keeps each
-// packet separate.
-const packetTee=()=>new PassThrough({objectMode:true});
-
-// receiver.subscribe() hands back the SAME stream if one is already registered for that user, and a stream we
-// have just destroy()ed stays registered until its "close" event fires. So subscribing straight after a destroy
-// returns a dead stream — the pipeline built on it ends instantly with 0 bytes. Always make sure we get a live one.
-function liveSubscribe(receiver,userId,options){
-  let st=receiver.subscribe(userId,options);
-  if(st.destroyed){
-    receiver.subscriptions?.delete?.(userId);
-    st=receiver.subscribe(userId,options);
-  }
-  return st;
-}
-
-// Every party has a relay bot (relays[j] sits in channels[j]; relays[0] is in the shotcaller's own
-// channel). The relays do two jobs: they PLAY audio into their party's channel, and they LISTEN to
-// their party so an additional caller can be picked up from whichever party they're standing in.
+'use strict';
+const {EndBehaviorType}=require('@discordjs/voice');
+const {OpusEncoder}=require('@discordjs/opus');
+const {VoiceMixer}=require('./mixer');
 class AudioRouter {
-  constructor(session){
-    this.s=session;
-    this.broadcastStream=null; this.broadcastUser=null;
-    this.additionalStreams=new Map(); // userId -> live subscription
-  }
-
-  // The dedicated caller goes to every party EXCEPT the one they're standing in — the people there already hear
-  // them live. Normally that's the shotcaller's own channel (sourceIndex 0, heard by the main bot), but if the
-  // dedicated caller is moved to another party, that party's relay picks them up instead (sourceIndex = its party).
-  broadcast(userId,sourceIndex=0,receiver=this.s.main?.receiver){
-    if(this.s.muted || !userId || !receiver) return;
-    if(this.s.dedicated.size && !this.s.dedicated.has(userId)) return;
-    const targets=this.s.relays.filter((_,i)=>i!==sourceIndex);
-    if(!targets.length) return;
-    // Discord reports a fresh "speaking start" after every pause over ~100ms, even mid-sentence. If we're already
-    // relaying this person, carry on with the live stream — it keeps delivering their audio until a real silence.
-    // Rebuilding the pipeline on every little pause cuts the tail off what's still queued and leaves a gap.
-    if(this.broadcastStream && !this.broadcastStream.destroyed && this.broadcastUser===userId) return;
-    console.log(`[audio] broadcast() starting for ${userId} from party ${sourceIndex+1}, to ${targets.length} parties`);
-    this.stopBroadcast();
-    const stream=liveSubscribe(receiver,userId,{
-      end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
-    });
-    this.broadcastStream=stream; this.broadcastUser=userId;
-    const tees=targets.map(packetTee);
-    tees.forEach((t,i)=>targets[i].playOpus(t));
-    let byteCount=0,chunkCount=0,done=false;
-    const end=()=>{
-      if(done) return; done=true; // 'end' and 'close' both fire — only wrap up once
-      console.log(`[audio] broadcast() ended for ${userId} — ${chunkCount} chunks, ${byteCount} bytes`);
-      tees.forEach(t=>t.end());
-      if(this.broadcastStream===stream){this.broadcastStream=null;this.broadcastUser=null;}
-    };
-    stream.on("data",b=>{
-      chunkCount++;byteCount+=b.length;
-      if(!this.s.muted)tees.forEach(t=>t.write(b));
-    });
-    stream.once("end",end);stream.once("close",end);
-    stream.once("error",e=>{console.error(`[audio] broadcast stream error for ${userId}:`,e);end();});
-  }
-
-  // An additional caller's callout: picked up by the relay of whichever party they're in
-  // (sourceIndex) and played into EVERY OTHER party's channel — including the shotcaller's own, so the
-  // caller and their party hear it too. The source party is skipped; they hear the caller live.
-  additionalBroadcast(sourceIndex,userId,receiver){
-    if(this.s.muted || !userId) return;
-    if(this.additionalStreams.has(userId)) return; // already relaying this person
-    const targets=this.s.relays.filter((_,i)=>i!==sourceIndex);
-    if(!targets.length) return;
-    console.log(`[audio] additional callout starting for ${userId} from party ${sourceIndex+1}, to ${targets.length} parties`);
-    const stream=liveSubscribe(receiver,userId,{
-      end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}
-    });
-    this.additionalStreams.set(userId,stream);
-    const tees=targets.map(packetTee);
-    tees.forEach((t,i)=>targets[i].playOpus(t));
-    let byteCount=0,chunkCount=0,done=false;
-    const end=()=>{
-      if(done) return; done=true;
-      console.log(`[audio] additional callout ended for ${userId} — ${chunkCount} chunks, ${byteCount} bytes`);
-      tees.forEach(t=>t.end());
-      if(this.additionalStreams.get(userId)===stream) this.additionalStreams.delete(userId);
-    };
-    stream.on("data",b=>{
-      chunkCount++;byteCount+=b.length;
-      if(!this.s.muted)tees.forEach(t=>t.write(b));
-    });
-    stream.once("end",end);stream.once("close",end);
-    stream.once("error",e=>{console.error(`[audio] additional callout stream error for ${userId}:`,e);end();});
-  }
-
-  stopBroadcast(){try{this.broadcastStream?.destroy()}catch{}this.broadcastStream=null;this.broadcastUser=null}
-  stopAdditionalFor(userId){try{this.additionalStreams.get(userId)?.destroy()}catch{}}
-  stopAdditional(){for(const st of this.additionalStreams.values()){try{st.destroy()}catch{}}this.additionalStreams.clear()}
-  stop(){this.stopBroadcast();this.stopAdditional()}
+ constructor(session){this.s=session;this.streams=new Map();this.mixers=new Map();this.stats={started:0,packets:0,lastRoute:null,recentRoutes:[]};}
+ mixer(target){if(!this.mixers.has(target))this.mixers.set(target,new VoiceMixer({encoder:new OpusEncoder(48000,2),play:stream=>target.playOpus(stream)}));return this.mixers.get(target);}
+ route(userId,sourceIndex,receiver,additional){
+ if(this.s.muted || this.s.paused || !receiver || !userId)return;
+ const source=sourceIndex<0?this.s.main:this.s.relays[sourceIndex]?.connection;
+ if(!source || source.state.status!=='ready' || source.receiver!==receiver || (sourceIndex>=0 && this.s.relays[sourceIndex]?.client?.isReady?.()===false))return;
+ if(additional?!this.s.additionalCallActive(userId):!this.s.dedicated.has(userId))return;
+ const key=(additional?'extra:':'main:')+userId;if(this.streams.get(key)?.receiver===receiver)return;
+ if(this.streams.has(key))this.stopKey(key);
+ const sourceId=sourceIndex<0?this.s.mainChannelId:this.s.channels[sourceIndex]?.id;
+ const targets=this.targets(sourceId,additional);
+ if(!targets.length)return;
+ let stream=receiver.subscribe(userId,{end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}});
+ if(stream.destroyed){receiver.subscriptions?.delete(userId);stream=receiver.subscribe(userId,{end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}});}
+ const decoder=new OpusEncoder(48000,2),mixers=targets.map(t=>this.mixer(t));let ended=false;
+ this.streams.set(key,{stream,mixers,receiver,sourceId,additional});mixers.forEach(m=>m.add(key));this.stats.started++;this.stats.lastRoute={at:Date.now(),kind:additional?'callout':'main',sourceChannelId:sourceId,targetChannelIds:targets.map(t=>t===this.s.followTarget?this.s.mainChannelId:this.s.channels[this.s.relays.indexOf(t)]?.id)};
+ this.stats.recentRoutes.unshift(this.stats.lastRoute);this.stats.recentRoutes=this.stats.recentRoutes.slice(0,20);
+ const end=()=>{if(ended)return;ended=true;if(this.streams.get(key)?.stream!==stream)return;this.streams.delete(key);mixers.forEach(m=>m.end(key));};
+ stream.on('data',packet=>{if(this.s.muted || this.s.paused)return;try{const pcm=decoder.decode(packet);this.stats.packets++;mixers.forEach(m=>m.push(key,pcm));}catch(error){console.error('[audio] decode failed:',error.message);}});
+ stream.once('end',end);stream.once('close',end);stream.once('error',error=>{console.error('[audio] receive error:',error.message);end();});
+ }
+ targets(sourceId,additional){
+  let targets=this.s.relays.filter((r,i)=>this.s.channels[i]?.id!==sourceId && r.connection?.state.status==='ready' && r.client?.isReady?.()!==false);
+  const main=this.s.mainCaller.snapshot();
+  if(additional && main.available)targets=targets.filter(r=>this.s.channels[this.s.relays.indexOf(r)]?.id===main.channelId);
+  if(this.s.followTarget && this.s.main?.state.status==='ready' && this.s.mainChannelId!==sourceId && (!additional || !main.available || main.channelId===this.s.mainChannelId))targets.push(this.s.followTarget);
+  return targets;
+ }
+ dropTarget(target){const mixer=this.mixers.get(target);if(!mixer)return;for(const item of this.streams.values()){const index=item.mixers.indexOf(mixer);if(index>=0)item.mixers.splice(index,1);}mixer.stop();this.mixers.delete(target);}
+ dropReceiver(receiver){for(const [key,item] of [...this.streams])if(item.receiver===receiver)this.stopKey(key);}
+ refreshTargets(){if(this.s.paused || this.s.muted)return;for(const [key,item] of this.streams){const wanted=this.targets(item.sourceId,item.additional).map(target=>this.mixer(target));for(const mixer of [...item.mixers])if(!wanted.includes(mixer)){mixer.remove(key);item.mixers.splice(item.mixers.indexOf(mixer),1);}for(const mixer of wanted)if(!item.mixers.includes(mixer)){item.mixers.push(mixer);mixer.add(key);}}}
+ broadcast(user,index=0,receiver){this.route(user,index,receiver,false);}
+ additionalBroadcast(index,user,receiver){this.route(user,index,receiver,true);}
+ stopKey(key){const item=this.streams.get(key);if(!item)return;this.streams.delete(key);item.mixers.forEach(m=>m.remove(key));item.stream.destroy();}
+ stopBroadcast(){for(const key of [...this.streams.keys()])if(key.startsWith('main:'))this.stopKey(key);}
+ stopAdditionalFor(id){this.stopKey('extra:'+id);}
+ stopAdditional(){for(const key of [...this.streams.keys()])if(key.startsWith('extra:'))this.stopKey(key);}
+ stop(){for(const key of [...this.streams.keys()])this.stopKey(key);for(const mixer of this.mixers.values())mixer.stop();this.mixers.clear();}
 }
 module.exports={AudioRouter};

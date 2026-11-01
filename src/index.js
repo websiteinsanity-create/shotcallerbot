@@ -6,6 +6,8 @@ const {
 const http=require("http");
 const config=require("./config");
 const {Session,MAX_ADDITIONAL_CALLERS}=require("./session");
+const {preflight}=require("./preflight");
+const {createOperation}=require("./operations");
 const janitor=require("./janitor");
 const {canUse,canBridge}=require("./permissions");
 const {handleApi}=require("./api");
@@ -36,7 +38,7 @@ async function register(){
 }
 
 client.once("ready",async()=>{
-  console.log(`Shotcaller online as ${client.user.tag}`);
+  console.log(`Shotcaller ${require("../package.json").version} online as ${client.user.tag}; Node ${process.version}`);
   await register();
   // Tidy up after any earlier run that stopped or restarted before it could clean its channels.
   for(const guild of client.guilds.cache.values()) await janitor.sweep(guild).catch(e=>console.warn("[cleanup] startup sweep failed:",e.message));
@@ -95,7 +97,7 @@ client.on("interactionCreate",async i=>{
       if(!s.isAdditionalCaller(i.user.id)) return i.reply({content:`You need the ${config.additionalCallerRoleName} role to make callouts.`,ephemeral:true}).catch(e=>console.error(e));
       const on=s.toggleCallout(i.user.id);
       const secs=Math.round(config.calloutAutoOffMs/1000);
-      return i.reply({content:on?`📢 You're **LIVE to everyone** for the next ${secs}s — every other party can hear you now. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
+      return i.reply({content:on?`📢 Callout is open for ${secs}s. It is routed to the available main caller, or to all other parties if no main caller is available. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
     }
 
     if(!canUse(i.member)) return i.reply({content:"No permission.",ephemeral:true}).catch(e=>console.error(e));
@@ -122,8 +124,8 @@ client.on("interactionCreate",async i=>{
     }
 
     if(i.isUserSelectMenu() && i.customId==="dedicated_select"){
-      s.dedicated=new Set(i.values);s.audio.stopBroadcast();
-      const msg=s.dedicated.size?`Dedicated caller(s) set to ${[...s.dedicated].map(id=>`<@${id}>`).join(", ")}.`:"Dedicated mode cleared — anyone can broadcast again.";
+      s.setDedicated(i.values);
+      const msg=s.dedicated.size?`Dedicated caller(s) set to ${[...s.dedicated].map(id=>`<@${id}>`).join(", ")}.`:"Main caller cleared — authorised PTT-Prio callouts go to all other parties.";
       await i.update({content:msg,components:[]}).catch(e=>console.error(e));
       await s.panelMessage?.edit(s.panel());
       return;
@@ -157,7 +159,9 @@ async function startSession(i,count,bridge){
     reservation=reserveStart(sessions,i.guildId);
     const s=await completeStart(sessions,i.guildId,reservation,async()=>{
       await i.deferUpdate();
-      return new Session(i.guild,i.member.voice.channel,i.member.id,count);
+      const operation=createOperation({id:reservation.sessionId,guildId:i.guildId,sessionId:reservation.sessionId,secrets:[config.mainToken,config.controlApiKey,...config.relayTokens]});
+      await preflight({guild:i.guild,channel:i.member.voice.channel,count,config,client,operation});
+      const session=new Session(i.guild,i.member.voice.channel,i.member.id,count);session.operation=operation;session.operationId=operation.id;return session;
     });
     if(bridge)s.bridge={active:false,partnerGuildId:config.bridgePartners.get(i.guildId)||null};
     lastchannel.remember(i.guildId,i.member.voice.channel);

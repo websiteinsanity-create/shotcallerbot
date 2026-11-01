@@ -3,12 +3,12 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),path=require('node:path'),{EventEmitter}=require('node:events');
 const GUILD='111111111111111111',CHANNEL='200000000000000001';
 const flush=async()=>{for(let i=0;i<12;i++)await Promise.resolve();};
-function harness(){
+function harness(options={}){
  const sessions=new Map(),created=[],config={controlApiKey:'key',relayTokens:['fake-token']};
  const channel={id:CHANNEL,name:'Anchor',type:2,members:new Map()};
  const guild={id:GUILD,channels:{fetch:async()=>channel}};
- class Session {constructor(){this.channels=[channel];this.relays=[];this.dedicated=new Set();this.additionalCallers=new Set();this.destroyed=false;this.audioStopped=false;created.push(this);}async start(){}async destroy(){this.destroyed=true;this.audioStopped=true;}}
- const module={exports:{}},context={module,exports:module.exports,URL,Buffer,console,require:name=>name==='discord.js'?{ChannelType:{GuildVoice:2}}:name==='./config'?config:name==='./session'?{Session}:name==='./lastchannel'?{get:()=>null,remember(){}}:name==='./lifecycle'?require('../src/lifecycle'):name==='./diagnostics'?{diagnosticsFor:()=>({schemaVersion:1})}:(()=>{throw Error(name)})()};
+ class Session {constructor(guild,selectedChannel,caller,count){this.count=count;this.channels=[channel];this.relays=[];this.dedicated=new Set();this.additionalCallers=new Set();this.destroyed=false;this.audioStopped=false;created.push(this);}async start(){this.started=true;}async destroy(){this.destroyed=true;this.audioStopped=true;}}
+ const module={exports:{}},context={module,exports:module.exports,URL,Buffer,console,require:name=>name==='discord.js'?{ChannelType:{GuildVoice:2}}:name==='./operations'?require('../src/operations'):name==='./preflight'?{preflight:options.preflight || (async ({count,operation})=>({ok:true,count:Math.min(12,count),operationId:operation?.id}))}:name==='./presence'?require('../src/presence'):name==='./config'?config:name==='./session'?{Session}:name==='./lastchannel'?{get:()=>null,remember(){}}:name==='./lifecycle'?require('../src/lifecycle'):name==='./diagnostics'?{diagnosticsFor:()=>({schemaVersion:1})}:(()=>{throw Error(name)})()};
  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/api.js'),'utf8'),context);
  const client={guilds:{cache:new Map([[GUILD,guild]])}};
  function call(sub,body={}){const req=new EventEmitter();req.method='POST';req.url=`/api/guilds/${GUILD}/session/${sub}`;req.headers={authorization:'Bearer key'};let status,result;const res={writeHead:s=>status=s,end:data=>result=JSON.parse(data)};const done=module.exports.handleApi(req,res,sessions,client);queueMicrotask(()=>{req.emit('data',JSON.stringify(body));req.emit('end');});return done.then(()=>({status,body:result}));}
@@ -38,7 +38,8 @@ test('stale session stop cannot stop a replacement, and failed cleanup remains r
 });
 test('actual Session startup cancellation cleans partial relays before any audio router is created',async()=>{
  let release,relayDestroyed=false,mainDestroyed=false,routers=0;const login=new Promise(r=>release=r),module={exports:{}};
- const context={module,exports:module.exports,console,setTimeout,clearTimeout,require:name=>{
+ const context={module,exports:module.exports,console,setTimeout,clearTimeout,clearInterval,require:name=>{
+  if(name==='./main-caller')return require('../src/main-caller');
   if(name==='discord.js')return{};
   if(name==='@discordjs/voice')return{joinVoiceChannel:()=>({state:{status:'ready'},on(){},destroy(){mainDestroyed=true;}})};
   if(name==='./config')return{relayTokens:['dummy'],calloutAutoOffMs:20000};
@@ -50,13 +51,13 @@ test('actual Session startup cancellation cleans partial relays before any audio
  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/session.js'),'utf8'),context);
  const channel={id:CHANNEL,name:'Anchor',send:async()=>{}},session=new module.exports.Session({id:GUILD,voiceAdapterCreator:{}},channel,null,1);session.loadCallers=async()=>{};session.calloutRow=()=>({});
  const sessions=new Map(),r=lifecycle.reserveStart(sessions,GUILD),starting=lifecycle.completeStart(sessions,GUILD,r,async()=>session);await flush();lifecycle.stopSession(sessions,GUILD,r.sessionId);release();await assert.rejects(starting,/cancelled/);
- assert.equal(routers,0);assert(relayDestroyed);assert(mainDestroyed);assert(!sessions.has(GUILD));
+ assert.equal(routers,0);assert(relayDestroyed);assert.equal(mainDestroyed,false);assert(!sessions.has(GUILD));
 });
 
 test('Session cleanup disconnects all voices immediately and waits for gateway logout before unlocking',async()=>{
  const order=[],module={exports:{}};let release;
  const logout=new Promise(r=>release=r);
- const context={module,exports:module.exports,console,clearTimeout,require:name=>name==='./janitor'?{retire:async c=>{order.push('retire:'+c.id);}}:{}};
+ const context={module,exports:module.exports,console,clearTimeout,clearInterval,require:name=>name==='./janitor'?{retire:async c=>{order.push('retire:'+c.id);}}:{}};
  vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/session.js'),'utf8'),context);
  const session=Object.create(module.exports.Session.prototype);
  Object.assign(session,{calloutTimers:new Map(),priorityTimers:new Map(),audio:{stop(){order.push('audio');}},relays:[{destroy(){order.push('relay1');return logout;}},{destroy(){order.push('relay2');}}],main:{destroy(){order.push('main');}},createdChannels:[{id:'empty'}],channels:[]});
@@ -67,8 +68,36 @@ test('Session cleanup disconnects all voices immediately and waits for gateway l
 
 test('actual Session cleanup failure can be retried without destroying the main connection twice',async()=>{
  const module={exports:{}};let fail=true,mainStops=0;
- vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/session.js'),'utf8'),{module,exports:module.exports,console,clearTimeout,require:name=>name==='./janitor'?{retire:async()=>{}}:{}});
+ vm.runInNewContext(fs.readFileSync(path.join(__dirname,'../src/session.js'),'utf8'),{module,exports:module.exports,console,clearTimeout,clearInterval,require:name=>name==='./janitor'?{retire:async()=>{}}:{}});
  const session=Object.create(module.exports.Session.prototype);
  Object.assign(session,{calloutTimers:new Map(),priorityTimers:new Map(),audio:{stop(){}},relays:[{async destroy(){if(fail)throw Error('logout failed');}}],main:{destroy(){mainStops++;if(mainStops>1)throw Error('already destroyed');}},createdChannels:[],channels:[]});
  await assert.rejects(session.destroy(),/cleanup failed/);fail=false;await session.destroy();assert.equal(mainStops,1);
+});
+
+test('API caps starts at twelve and rejects invalid main caller IDs before reserving a session',async()=>{
+ const h=harness();assert.equal((await h.call('start',{count:15,channelId:CHANNEL,dedicatedCallerId:'bad'})).status,400);assert.equal(h.sessions.size,0);
+ const result=await h.call('start',{count:15,channelId:CHANNEL});assert.equal(result.status,200);assert.equal(h.created[0].count,12);
+});
+
+test('pause and wait reject stale session identities and pause does not stop the session',async()=>{
+ const h=harness();const s=new h.Session();s.setPaused=value=>s.paused=value;s.mainCaller={wait:()=>{s.waited=true;},snapshot:()=>({})};h.sessions.set(GUILD,s);
+ assert.equal((await h.call('pause',{sessionId:'wrong',paused:true})).status,409);
+ const id=lifecycle.idOf(s);assert.equal((await h.call('pause',{sessionId:id,paused:true})).status,200);assert.equal(s.paused,true);assert.equal(h.sessions.get(GUILD),s);assert.equal(s.destroyed,false);
+ assert.equal((await h.call('pause',{sessionId:id,paused:false})).status,200);assert.equal(s.paused,false);
+ assert.equal((await h.call('main-wait',{sessionId:'wrong',absenceId:'old'})).status,409);
+});
+
+test('stop during preflight cancels the reserved start before any session start side effect',async()=>{
+ let release;const h=harness({preflight:()=>new Promise(resolve=>release=resolve)});
+ const starting=h.call('start',{count:2,channelId:CHANNEL,operationId:'cancel-preflight'});await flush();assert.equal(typeof release,'function');
+ const stop=await h.call('stop');assert.equal(stop.body.sessionState,'stopping');release({ok:true,count:2});const result=await starting;
+ assert.equal(result.status,409);assert.equal(h.sessions.size,0);assert.equal(h.created[0].started,undefined);assert.equal(h.created[0].destroyed,true);
+});
+test('a failed preflight releases the start reservation and does not construct a voice session',async()=>{
+ const h=harness({preflight:async()=>{throw Object.assign(Error('Relay unavailable'),{status:502});}});
+ const r=await h.call('start',{count:2,channelId:CHANNEL,operationId:'preflight-failed'});assert.equal(r.status,502);assert.equal(r.body.operationId,'preflight-failed');assert.equal(h.created.length,0);assert.equal(h.sessions.size,0);
+});
+test('preflight rejects a session change that happened while checks were in flight',async()=>{
+ let release;const h=harness({preflight:()=>new Promise(resolve=>release=resolve)});
+ const pending=h.call('preflight',{count:2,channelId:CHANNEL,operationId:'preflight-race'});await flush();h.sessions.set(GUILD,new h.Session());release({ok:true,count:2});const r=await pending;assert.equal(r.status,409);assert.equal(h.sessions.size,1);
 });
