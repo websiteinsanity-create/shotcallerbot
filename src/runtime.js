@@ -1,13 +1,14 @@
 'use strict';
 const fs=require('node:fs'),path=require('node:path');
 const {AllianceBridge}=require('./bridge');
+const {loadRuntimeState}=require('./runtime-state');
 const {reserveStart,completeStart,stopSession}=require('./lifecycle');
 class Runtime {
  constructor(sessions,client,config){
   this.sessions=sessions;this.client=client;this.config=config;this.file=path.join(config.dataDir,'runtime.json');
-  try{this.saved=JSON.parse(fs.readFileSync(this.file,'utf8'));if(this.saved.version!==1 || !this.saved.sessions)throw Error('Invalid runtime schema');}
-  catch(e){if(e.code!=='ENOENT')throw Error('Cannot safely load runtime state: '+e.message);this.saved={version:1,sessions:{},bridge:{}};}
   if(!!config.insanityGuildId!==!!config.allianceGuildId || (config.insanityGuildId && (!/^\d{15,25}$/.test(config.insanityGuildId) || !/^\d{15,25}$/.test(config.allianceGuildId) || config.insanityGuildId===config.allianceGuildId)))throw Error('Set two distinct Discord ids in INSANITY_GUILD_ID and ALLIANCE_GUILD_ID.');
+  // Legacy data is migrated, damaged data is preserved under a new name; see runtime-state.js.
+  const loaded=loadRuntimeState(this.file,{now:config.now,log:config.log});this.saved=loaded.state;this.loadResult={kind:loaded.kind,notes:loaded.notes,preservedAs:loaded.preservedAs?path.basename(loaded.preservedAs):null};
   this.restoring=new Set();this.retryAt=new Map();
   this.bridge=config.insanityGuildId && config.allianceGuildId?new AllianceBridge({sessions,insanityGuildId:config.insanityGuildId,allianceGuildId:config.allianceGuildId,saved:this.saved.bridge,save:value=>{this.saved.bridge=value;this.write();}}):null;
   sessions.runtime=this;
