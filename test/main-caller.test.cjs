@@ -1,0 +1,7 @@
+const {test}=require('node:test'),assert=require('node:assert/strict');
+const {MainCaller}=require('../src/main-caller');
+const ID='100000000000000001';
+test('absence warning applies only to sessions started with a main caller',()=>{let now=0;const c=new MainCaller(null,()=>now);c.select([ID]);c.observe(null,false);now=60000;assert.equal(c.snapshot().showReplacement,false);});
+test('continuous absence, wait, return and replacement are session-owned',()=>{let now=100;const c=new MainCaller(ID,()=>now);c.observe(null,false);now+=29999;assert.equal(c.snapshot().showReplacement,false);now++;assert(c.snapshot().showReplacement);const old=c.snapshot().absenceId;c.wait(old);now+=60000;assert.equal(c.snapshot().showReplacement,false);c.observe('party',true);c.observe(null,false);now+=30000;assert(c.snapshot().showReplacement);assert.throws(()=>c.wait(old));c.select(['100000000000000002']);c.observe('external',true);assert.equal(c.snapshot().callerId,'100000000000000002');assert.equal(c.snapshot().showReplacement,false);});
+test('pause suppresses warnings and resumes with a new continuous absence period',()=>{let now=1;const c=new MainCaller(ID,()=>now);c.observe(null,false);now+=30000;c.pause(true);assert.equal(c.snapshot().showReplacement,false);c.pause(false);c.observe(null,false);assert.equal(c.snapshot().showReplacement,false);now+=30000;assert(c.snapshot().showReplacement);});
+test('multiple main callers are rejected before modifying state',()=>{const c=new MainCaller(ID);assert.throws(()=>c.select([ID,'100000000000000002']));assert.equal(c.id,ID);});

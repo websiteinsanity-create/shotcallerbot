@@ -10,6 +10,8 @@ services:
     network_mode: host
     environment:
       - MAIN_BOT_TOKEN=${MAIN_BOT_TOKEN}
+      - INSANITY_GUILD_ID=${INSANITY_GUILD_ID:-}
+      - ALLIANCE_GUILD_ID=${ALLIANCE_GUILD_ID:-}
       - CLIENT_ID=${CLIENT_ID}
       - RELAY_BOT_TOKENS=${RELAY_BOT_TOKENS}
       - DEV_GUILD_ID=${DEV_GUILD_ID:-}
@@ -39,3 +41,4 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
