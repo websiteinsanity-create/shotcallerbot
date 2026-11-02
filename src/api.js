@@ -14,6 +14,9 @@ const { Session } = require("./session");
 const lastchannel = require("./lastchannel");
 const { diagnosticsFor } = require("./diagnostics");
 const {idOf,reserveStart,completeStart,stopSession}=require("./lifecycle");
+const {preflight}=require("./preflight");
+const {createOperation,operationId,recentOperations}=require("./operations");
+const newOperation=(guildId,id,sessionId)=>createOperation({id,guildId,sessionId,secrets:[config.mainToken,config.controlApiKey,...config.relayTokens]});
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
@@ -58,27 +61,20 @@ function authorized(req) {
 // muted" setting needs that, and would otherwise have no way to tell a player just listening along without
 // a mic from one who's actually AFK with voice chat closed entirely. Kept alongside `connected`/
 // `connectedUserIds`, not replacing them, so anything reading just those is unaffected.
-function presenceOf(channel) {
-  const humans = channel && channel.members ? [...channel.members.values()].filter((m) => !m.user?.bot) : [];
-  return {
-    connected: humans.length,
-    connectedUserIds: humans.map((m) => m.id),
-    connectedStates: humans.map((m) => ({ id: m.id, mute: !!m.voice.mute, deaf: !!m.voice.deaf })),
-  };
-}
+const {readPresence,presenceOf}=require("./presence");
 function sessionStatus(s, client) {
-  if(s.lifecycle)return {active:false,sessionId:idOf(s),sessionState:s.lifecycle,diagnostics:{...diagnosticsFor(null,client,config.relayTokens.length,s.lifecycle==='starting'),sessionState:s.lifecycle}};
+  if(s.lifecycle)return {active:false,sessionId:idOf(s),operationId:s.operationId || null,sessionState:s.lifecycle,operations:recentOperations(s.guild?.id || s.session?.guild?.id),diagnostics:{...diagnosticsFor(null,client,config.relayTokens.length,s.lifecycle==='starting'),sessionState:s.lifecycle}};
   const names = (set) => [...set];
   return {
     active: true,
-    sessionId:idOf(s),sessionState:"active",
+    sessionId:idOf(s),operationId:s.operationId || null,sessionState:"active",connectionIssue:s.relays.some(r=>r.connection?.state.status!=="ready" || r.client?.isReady?.()===false),operations:recentOperations(s.guild?.id),
     diagnostics: diagnosticsFor(s, client || s.guild?.client, config.relayTokens.length),
-    muted: s.muted,
+    muted: s.muted,paused:!!s.paused,mainCaller:s.mainCaller?.snapshot() || null,audioTelemetry:s.audio?{...s.audio.stats,lastPrioritySignal:s.lastPrioritySignal || null}:null,
     dedicated: names(s.dedicated),
     additionalCallers: names(s.additionalCallers),
     callerRoleId: s.callerRoleId,
     bridge: s.bridge ? { active: !!s.bridge.active, partnerGuildId: s.bridge.partnerGuildId || null } : null,
-    parties: s.channels.map((c, i) => ({ index: i + 1, channelId: c.id, name: c.name, ...presenceOf(c) })),
+    parties: s.channels.map((c, i) => ({ index: i + 1, channelId: c.id, name: c.name, voiceState:s.relays[i]?.connection?.state.status || null,connectionIssue:!!s.relays[i] && (s.relays[i].connection?.state.status!=="ready" || s.relays[i].client?.isReady?.()===false), ...presenceOf(c) })),
   };
 }
 
@@ -114,16 +110,22 @@ async function handleApi(req, res, sessions, client) {
     if (req.method !== "GET") { send(res, 404, { error: "Not found" }); return true; }
     const guild = client.guilds.cache.get(vp[1]);
     if (!guild) { send(res, 404, { error: "This bot is not in that server." }); return true; }
+    if(client.isReady?.()===false){send(res,503,{error:"Discord gateway is not ready; voice presence is unknown."});return true;}
     const ids = (url.searchParams.get("channels") || "").split(",").map((s) => s.trim()).filter(Boolean);
-    const channels = ids.map((id) => {
-      const c = guild.channels.cache.get(id);
-      if (!c || c.type !== ChannelType.GuildVoice) return { channelId: id, found: false, connected: 0, connectedUserIds: [], connectedStates: [] };
-      return { channelId: id, found: true, ...presenceOf(c) };
-    });
+    const channels = await readPresence(guild,ids,{voiceType:ChannelType.GuildVoice});
     send(res, 200, { channels });
     return true;
   }
 
+  const callers=/^\/api\/guilds\/(\d{15,25})\/callers\/?$/.exec(url.pathname);
+  if(callers){
+    if(!authorized(req)){send(res,401,{error:'Unauthorized'});return true;}
+    if(req.method!=='GET'){send(res,404,{error:'Not found'});return true;}
+    const guild=client.guilds.cache.get(callers[1]);if(!guild){send(res,404,{error:'Guild unavailable'});return true;}
+    try{await guild.members.fetch();const allowed=[config.shotcallerRoleName,config.additionalCallerRoleName,config.officerRoleName,config.leaderRoleName].map(n=>n.toLowerCase());
+      send(res,200,{callers:[...guild.members.cache.values()].filter(m=>!m.user.bot && (m.permissions.has(require('discord.js').PermissionFlagsBits.Administrator) || m.roles.cache.some(r=>allowed.includes(r.name.toLowerCase())))).map(m=>({id:m.id,name:m.displayName}))});
+    }catch{send(res,502,{error:'Caller lookup failed'});}return true;
+  }
   const m = /^\/api\/guilds\/(\d{15,25})\/session(\/[a-z-]+)?\/?$/.exec(url.pathname);
   if (!m) return false;
 
@@ -134,8 +136,28 @@ async function handleApi(req, res, sessions, client) {
   const s = sessions.get(guildId);
 
   try {
+    const bridge=sessions.runtime?.bridge;
+    const admin=req.headers['x-shotcaller-admin']==='true' && guildId===config.insanityGuildId;
+    if(sub==='/bridge' && req.method==='POST'){
+      if(!bridge?.belongs(guildId))throw Object.assign(Error('Configure INSANITY_GUILD_ID and ALLIANCE_GUILD_ID.'),{status:409});
+      const body=await readJsonBody(req);send(res,200,bridge.configure(guildId,body.action,body,admin));return true;
+    }
     if (sub === "" && req.method === "GET") {
-      send(res, 200, s ? sessionStatus(s, client) : { active: false, sessionId:null,sessionState:"inactive",lastVoiceChannel: lastchannel.get(guildId), diagnostics: diagnosticsFor(null, client, config.relayTokens.length, sessions.has(guildId)) });
+      send(res, 200, s ? {...sessionStatus(s, client),bridge:sessions.runtime?.snapshot(guildId,admin)} : { bridge:sessions.runtime?.snapshot(guildId,admin), active: false, sessionId:null,sessionState:"inactive",operations:recentOperations(guildId),lastVoiceChannel: lastchannel.get(guildId), diagnostics: diagnosticsFor(null, client, config.relayTokens.length, sessions.has(guildId)) });
+      return true;
+    }
+
+    if(sub==="/preflight" && req.method==="POST"){
+      const body=await readJsonBody(req),guild=client.guilds.cache.get(guildId),operation=newOperation(guildId,body.operationId);
+      const existingId=idOf(sessions.get(guildId));
+      try{
+        if(sessions.has(guildId) && !(body.allowActive===true && !sessions.get(guildId).lifecycle))throw Object.assign(Error('Shotcaller is active or transitioning.'),{status:409});
+        if(!guild)throw Object.assign(Error('This bot is not in that server.'),{status:404});
+        const channel=await guild.channels.fetch(String(body.channelId || ''));
+        const result=await preflight({guild,channel,count:body.count,config,client,operation});
+        if(idOf(sessions.get(guildId))!==existingId)throw Object.assign(Error('Session changed during preflight. Try again.'),{status:409});
+        send(res,200,{...result,operationId:operation.id,existingSessionId:existingId});
+      }catch(error){send(res,error.status || 502,{error:error.message,operationId:operation.id});}
       return true;
     }
 
@@ -144,26 +166,31 @@ async function handleApi(req, res, sessions, client) {
       // first wins. Lifecycle records keep the slot reserved through start and teardown.
       if (sessions.has(guildId)) { send(res, 409, { error: "A Shotcaller session is already active." }); return true; }
       const body = await readJsonBody(req);
-      const count = Number(body.count);
-      if (!Number.isInteger(count) || count < 1 || count > 12) { send(res, 400, { error: "count must be a whole number from 1 to 12." }); return true; }
+      const requestedCount = Number(body.count);
+      const count = Math.min(12,requestedCount);
+      if (!Number.isInteger(requestedCount) || requestedCount < 1) { send(res, 400, { error: "count must be a positive whole number; at most 12 channels are started." }); return true; }
+      if(body.dedicatedCallerId && !/^\d{15,25}$/.test(String(body.dedicatedCallerId))){send(res,400,{error:"Choose a valid main caller Discord user id."});return true;}
       const channelId = String(body.channelId || "");
       if (!/^\d{15,25}$/.test(channelId)) { send(res, 400, { error: "channelId must be a Discord voice channel id." }); return true; }
       const guild = client.guilds.cache.get(guildId);
       if (!guild) { send(res, 404, { error: "This bot is not in that server." }); return true; }
       // Claim the common Discord/HTTP slot before the asynchronous channel lookup.
-      const reservation=reserveStart(sessions,guildId);
+      const opId=operationId(body.operationId);
+      const reservation=reserveStart(sessions,guildId);reservation.operationId=opId;
+      const operation=newOperation(guildId,opId,reservation.sessionId);
       try {
         const s2=await completeStart(sessions,guildId,reservation,async()=>{
           let channel;try{channel=await guild.channels.fetch(channelId);}catch{}
           if(!channel || channel.type!==ChannelType.GuildVoice){const e=Error('That channel is not a voice channel in this server.');e.status=400;throw e;}
-          return new Session(guild,channel,body.dedicatedCallerId?String(body.dedicatedCallerId):null,count);
+          await preflight({guild,channel,count,config,client,operation});
+          const session=new Session(guild,channel,body.dedicatedCallerId?String(body.dedicatedCallerId):null,count);session.operation=operation;session.operationId=opId;return session;
         });
         // Optional display renames must not hold session activation or resurrect a stopped session.
         const names=Array.isArray(body.partyNames)?body.partyNames:[];
         for(let i=1;i<s2.channels.length;i++)if(names[i-1])s2.channels[i].setName(String(names[i-1]).slice(0,80)).catch(e=>console.warn('[api] party rename failed:',e.message));
         lastchannel.remember(guildId,s2.commandVoice);
         send(res,200,sessionStatus(s2,client));
-      }catch(e){send(res,e.status || 502,{error:e.message || 'Could not start Shotcaller.'});}
+      }catch(e){operation.event('start.failed',{error:e,status:'failed'});send(res,e.status || 502,{error:e.message || 'Could not start Shotcaller.',operationId:opId});}
       return true;
     }
 
@@ -173,8 +200,16 @@ async function handleApi(req, res, sessions, client) {
     if (sub === "/stop" && req.method === "POST") {
       const body=await readJsonBody(req);
       if(!s && sessions.has(guildId)){const e=Error('This session changed. Refresh before stopping it.');e.status=409;throw e;}
-      send(res,200,stopSession(sessions,guildId,body.sessionId || idOf(s))); 
+      send(res,200,stopSession(sessions,guildId,body.sessionId || idOf(s),body.bridgeChoice)); 
       return true;
+    }
+
+    if ((sub === "/pause" || sub === "/main-wait") && req.method === "POST") {
+      const body=await readJsonBody(req);
+      if(sessions.get(guildId)!==s || s.lifecycle || body.sessionId!==idOf(s)){send(res,409,{error:"Session changed. Refresh and try again."});return true;}
+      if(sub==="/pause") {if(typeof body.paused!=="boolean"){send(res,400,{error:"paused must be a boolean."});return true;}s.setPaused(body.paused);}
+      else s.mainCaller.wait(body.absenceId);
+      send(res,200,sessionStatus(s,client));return true;
     }
 
     if (sub === "/mute" && req.method === "POST") {
@@ -182,6 +217,7 @@ async function handleApi(req, res, sessions, client) {
       if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       s.muted = typeof body.muted === "boolean" ? body.muted : !s.muted;
       if (s.muted) s.audio.stop();
+      sessions.runtime?.remember(s);sessions.runtime?.bridge?.reconcile();if(!s.muted)s.resumeSpeaking();
       await s.panelMessage?.edit(s.panel()).catch(() => {});
       send(res, 200, { muted: s.muted });
       return true;
@@ -191,7 +227,11 @@ async function handleApi(req, res, sessions, client) {
       const body = await readJsonBody(req);
       if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       if (!Array.isArray(body.userIds)) { send(res, 400, { error: "userIds must be an array of Discord user ids." }); return true; }
-      s.dedicated = new Set(body.userIds.map(String));
+      const ids=[...new Set(body.userIds.map(String))];
+      if(ids.length>1 || ids.some(id=>!/^\d{15,25}$/.test(id))){send(res,400,{error:"Choose zero or one main caller."});return true;}
+      if(body.sessionId && body.sessionId!==idOf(s)){send(res,409,{error:"Session changed."});return true;}
+      if(body.absenceId && (body.absenceId!==s.mainCaller?.snapshot().absenceId || !s.mainCaller?.snapshot().showReplacement)){send(res,409,{error:"Main caller availability changed."});return true;}
+      s.setDedicated(ids);
       s.audio.stopBroadcast(); // same as the dedicated_select menu handler: cut any in-flight broadcast, the new set takes over from the next speech
       await s.panelMessage?.edit(s.panel()).catch(() => {});
       send(res, 200, { dedicated: [...s.dedicated] });
@@ -202,22 +242,18 @@ async function handleApi(req, res, sessions, client) {
       const body = await readJsonBody(req);
       if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       if (!Array.isArray(body.userIds)) { send(res, 400, { error: "userIds must be an array of Discord user ids." }); return true; }
-      s.additionalCallers = new Set(body.userIds.map(String));
+      s.additionalCallers = new Set(body.userIds.map(String));sessions.runtime?.remember(s);
       await s.panelMessage?.edit(s.panel()).catch(() => {});
       send(res, 200, { additionalCallers: [...s.additionalCallers] });
       return true;
     }
 
-    if (sub === "/bridge" && req.method === "POST") {
-      send(res, 501, { error: "Bridge control isn't available yet - it's still a work in progress." });
-      return true;
-    }
 
     send(res, 404, { error: "Not found" });
     return true;
   } catch (e) {
     console.error("[api]", req.method, url.pathname, e);
-    send(res, e.status || 500, { error: e.message || "Internal error" });
+    send(res, e.status || 500, { error: e.message || "Internal error",choices:e.choices });
     return true;
   }
 }
