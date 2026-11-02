@@ -59,7 +59,13 @@ class Session {
     this.ensureStarting();
 
     this.channels=[this.commandVoice];
-    if(this.count>1) await this.createPartyChannels();
+    if(this.restoreSpec?.channels?.length){
+      for(let index=1;index<this.count;index++){const item=this.restoreSpec.channels[index];let c;
+        if(item)try{c=await this.guild.channels.fetch(item.id);}catch{}
+        if(c && c.guild.id===this.guild.id && c.type===ChannelType.GuildVoice){this.channels[index]=c;if(item.created)this.createdChannels.push(c);}
+      }
+      if(this.count>1)await this.createPartyChannels();
+    }else if(this.count>1) await this.createPartyChannels();
     this.ensureStarting();
 
     // Post the callout button in every party's chat (the shotcaller's own channel too — best effort,
@@ -93,9 +99,18 @@ class Session {
     this.voiceListener=()=>this.syncMainCaller();
     this.guild.client.on("voiceStateUpdate",this.voiceListener);
     this.followTimer=setInterval(()=>this.syncMainCaller(),1000);this.followTimer.unref?.();
-    this.syncMainCaller();
+    this.syncMainCaller();if(this.restoreSpec?.paused)this.setPaused(true);this.onChanged?.();
   }
 
+  resumeSpeaking(){
+    if(this.startCancelled || !this.audio || this.paused || this.muted)return;
+    for(let i=-1;i<this.relays.length;i++){const receiver=i<0?this.main?.receiver:this.relays[i]?.connection?.receiver;
+      for(const user of receiver?.speaking?.users?.keys?.() || []){
+        if(this.dedicated.has(user))this.audio.broadcast(user,i,receiver);
+        else if(this.additionalCallActive(user))this.audio.additionalBroadcast(i,user,receiver);
+      }
+    }
+  }
   // Who is listened to where:
   //  - the main bot listens to the shotcaller's own channel (party 1) and relays the dedicated caller from there;
   //  - every relay listens to its own party, so a dedicated caller who has been moved to another party is still
@@ -115,7 +130,7 @@ class Session {
     if(!this.audio || this.startCancelled)return;
     if(status!=='ready'){
       this.audio.dropTarget(relay);this.audio.dropReceiver(relay.connection?.receiver);
-      this.syncMainCaller();this.audio.refreshTargets();return;
+      this.syncMainCaller();this.bridge?.reconcile();this.audio.refreshTargets();return;
     }
     this.wireReceiver(index);this.syncMainCaller();this.audio.refreshTargets();
     const receiver=relay.connection?.receiver;
@@ -128,12 +143,13 @@ class Session {
   setDedicated(ids){
     this.mainCaller.select(ids);this.dedicated=new Set(ids);this.audio?.stopBroadcast();
     for(const id of ids)this.audio?.stopAdditionalFor(id);
-    this.followSignature=null;this.syncMainCaller();
+    this.followSignature=null;this.syncMainCaller();this.onChanged?.();this.onChanged?.();
   }
   setPaused(value){
     this.paused=!!value;this.mainCaller.pause(this.paused);this.audio?.stop();
     for(const map of [this.calloutTimers,this.priorityTimers]){for(const t of map.values())clearTimeout(t);map.clear();}
     this.calloutOpen.clear();this.priorityHeld.clear();
+    this.onChanged?.();this.bridge?.reconcile();
     if(!this.paused){
       this.syncMainCaller();
       const user=this.mainCaller.id;
@@ -193,7 +209,7 @@ class Session {
   //  "category" — the old behaviour: a separate "Shotcaller Parties" category, open to everyone.
   async createPartyChannels(){
     // Clear out any channels an earlier run left behind (empty ones go now, occupied ones when they empty).
-    await janitor.sweep(this.guild).catch(e=>console.warn("[cleanup] sweep failed:",e.message));
+    await janitor.sweep(this.guild,this.channels.filter(Boolean).map(c=>c.id)).catch(e=>console.warn("[cleanup] sweep failed:",e.message));
 
     let parentId=null, overwrites;
     if(config.partyPlacement==="category"){
@@ -209,12 +225,13 @@ class Session {
     }
 
     for(let i=1;i<this.count;i++){
+      if(this.channels[i])continue;
       this.ensureStarting();
       const began=Date.now();
       const c=await this.makePartyChannel(`Party ${i+1}`,parentId,overwrites);
       this.operation?.event("channel.created",{channelId:c.id,relay:i+1,durationMs:Date.now()-began});
       janitor.track(c); // remembered on disk straight away, so cleanup can still find it after a restart
-      this.channels.push(c);
+      this.channels[i]=c;
       this.createdChannels.push(c);
       this.ensureStarting();
     }
@@ -349,8 +366,8 @@ class Session {
     );
   }
 
-  async destroy(){
-    this.startCancelled=true;
+  async destroy({preserveChannels=false}={}){
+    this.startCancelled=true;this.bridge?.reconcile();
     clearInterval(this.followTimer);if(this.voiceListener)this.guild.client.removeListener("voiceStateUpdate",this.voiceListener);this.followGeneration++;
     this.followPlayer?.stop(true);
     for(const m of [this.calloutTimers,this.priorityTimers]) for(const t of m.values()) clearTimeout(t);
@@ -361,7 +378,7 @@ class Session {
     try{if(this.main?.state?.status!=='destroyed')this.main?.destroy();this.main=null;}catch(e){errors.push(e);}
     for(const result of await Promise.allSettled(pending))if(result.status==='rejected')errors.push(result.reason);
     // Occupied channels are retired without kicking listeners; the janitor deletes them when empty.
-    for(const c of this.createdChannels)try{await janitor.retire(c);}catch(e){errors.push(e);}
+    for(const c of preserveChannels?[]:this.createdChannels)try{await janitor.retire(c);}catch(e){errors.push(e);}
     if(errors.length)throw new AggregateError(errors,'Session cleanup failed; retry Stop.');
     this.channels=[]; this.createdChannels=[];
   }
@@ -379,13 +396,13 @@ class Session {
         {name:"Audio",value:this.muted?"🔇 Muted":"🔊 Active",inline:true},
         {name:"Dedicated",value:this.dedicated.size?names(this.dedicated):"None (PTT-Prio to all parties)",inline:true},
         {name:"Additional callers",value:[this.callerRoleId?`<@&${this.callerRoleId}> role`:`⚠️ role "${config.additionalCallerRoleName}" not found`,...(this.additionalCallers.size?[`+ extras: ${names(this.additionalCallers)}`]:[])].join("\n"),inline:true},
-        {name:"Bridge",value:this.bridge?.active?"Active":"Off",inline:true}
+        {name:"Bridge",value:this.bridge?.desired?this.bridge.state:"Off",inline:true}
       );
     const buttons=new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId("mute").setLabel(this.muted?"Unmute":"Mute").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("dedicated").setLabel("Dedicated").setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId("additional_setup").setLabel("Extra Callers").setStyle(ButtonStyle.Secondary),
-      new ButtonBuilder().setCustomId("bridge").setLabel(this.bridge?.active?"End Bridge":"Bridge").setStyle(ButtonStyle.Secondary),
+      new ButtonBuilder().setCustomId("bridge").setLabel(this.bridge?.desired?"End Bridge":"Bridge").setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId("stop").setLabel("Stop").setStyle(ButtonStyle.Danger)
     );
     return {embeds:[e],components:[buttons]};

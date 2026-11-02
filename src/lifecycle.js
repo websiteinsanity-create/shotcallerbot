@@ -17,24 +17,25 @@ async function completeStart(sessions,guildId,record,factory){
   await session.start();
   if(record.cancelRequested || sessions.get(guildId)!==record)throw fault('Session start cancelled.');
   session.operation?.event("session.active",{count:session.count,status:"active"});
-  sessions.set(guildId,session);return session;
+  sessions.set(guildId,session);sessions.runtime?.started(session);return session;
  }catch(error){
   session?.operation?.event("session.start.failed",{error,status:"failed"});
   if(session){try{await session.destroy();}catch(cleanup){record.lifecycle='stop-failed';record.cleanupError=true;console.error('[lifecycle] start cleanup failed:',cleanup);throw error;}}
-  if(sessions.get(guildId)===record)sessions.delete(guildId);throw error;
+  if(sessions.get(guildId)===record || sessions.get(guildId)===session)sessions.delete(guildId);throw error;
  }finally{record.resolve();}
 }
-function stopSession(sessions,guildId,expectedId){
+function stopSession(sessions,guildId,expectedId,bridgeChoice){
  const current=sessions.get(guildId);
  if(!current)return{ok:true,sessionState:'inactive',sessionId:null};
  const id=idOf(current);if(expectedId && expectedId!==id)throw fault('This session has changed. Refresh before stopping it.');
+ sessions.runtime?.beforeStop(guildId,bridgeChoice);
  if(current.lifecycle==='starting' || (current.lifecycle==='stopping' && current.cancelRequested)){
-  current.cancelRequested=true;current.lifecycle='stopping';current.session?.cancelStart?.();
+  current.cancelRequested=true;current.lifecycle='stopping';current.session?.cancelStart?.();sessions.runtime?.stopped();
   return{ok:true,sessionState:'stopping',sessionId:id};
  }
  if(current.lifecycle==='stopping')return{ok:true,sessionState:'stopping',sessionId:id};
  const session=current.lifecycle==='stop-failed'?current.session:current;
- const record={lifecycle:'stopping',sessionId:id,operationId:session.operationId,session};session.operation?.event('session.stop',{status:'stopping'});sessions.set(guildId,record);
+ const record={lifecycle:'stopping',sessionId:id,operationId:session.operationId,session};session.operation?.event('session.stop',{status:'stopping'});sessions.set(guildId,record);sessions.runtime?.stopped();
  // destroy() stops audio/voice synchronously before its first slow channel-retirement await.
  let cleanup;try{cleanup=session.destroy();}catch(error){cleanup=Promise.reject(error);}
  record.done=Promise.resolve(cleanup).then(()=>{session.operation?.event('session.stopped',{status:'inactive'});if(sessions.get(guildId)===record)sessions.delete(guildId);},error=>{session.operation?.event('session.stop.failed',{status:'stop-failed',error});record.lifecycle='stop-failed';record.cleanupError=true;console.error('[lifecycle] stop cleanup failed:',error);});

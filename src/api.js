@@ -117,6 +117,15 @@ async function handleApi(req, res, sessions, client) {
     return true;
   }
 
+  const callers=/^\/api\/guilds\/(\d{15,25})\/callers\/?$/.exec(url.pathname);
+  if(callers){
+    if(!authorized(req)){send(res,401,{error:'Unauthorized'});return true;}
+    if(req.method!=='GET'){send(res,404,{error:'Not found'});return true;}
+    const guild=client.guilds.cache.get(callers[1]);if(!guild){send(res,404,{error:'Guild unavailable'});return true;}
+    try{await guild.members.fetch();const allowed=[config.shotcallerRoleName,config.additionalCallerRoleName,config.officerRoleName,config.leaderRoleName].map(n=>n.toLowerCase());
+      send(res,200,{callers:[...guild.members.cache.values()].filter(m=>!m.user.bot && (m.permissions.has(require('discord.js').PermissionFlagsBits.Administrator) || m.roles.cache.some(r=>allowed.includes(r.name.toLowerCase())))).map(m=>({id:m.id,name:m.displayName}))});
+    }catch{send(res,502,{error:'Caller lookup failed'});}return true;
+  }
   const m = /^\/api\/guilds\/(\d{15,25})\/session(\/[a-z-]+)?\/?$/.exec(url.pathname);
   if (!m) return false;
 
@@ -127,8 +136,14 @@ async function handleApi(req, res, sessions, client) {
   const s = sessions.get(guildId);
 
   try {
+    const bridge=sessions.runtime?.bridge;
+    const admin=req.headers['x-shotcaller-admin']==='true' && guildId===config.insanityGuildId;
+    if(sub==='/bridge' && req.method==='POST'){
+      if(!bridge?.belongs(guildId))throw Object.assign(Error('Configure INSANITY_GUILD_ID and ALLIANCE_GUILD_ID.'),{status:409});
+      const body=await readJsonBody(req);send(res,200,bridge.configure(guildId,body.action,body,admin));return true;
+    }
     if (sub === "" && req.method === "GET") {
-      send(res, 200, s ? sessionStatus(s, client) : { active: false, sessionId:null,sessionState:"inactive",operations:recentOperations(guildId),lastVoiceChannel: lastchannel.get(guildId), diagnostics: diagnosticsFor(null, client, config.relayTokens.length, sessions.has(guildId)) });
+      send(res, 200, s ? {...sessionStatus(s, client),bridge:sessions.runtime?.snapshot(guildId,admin)} : { bridge:sessions.runtime?.snapshot(guildId,admin), active: false, sessionId:null,sessionState:"inactive",operations:recentOperations(guildId),lastVoiceChannel: lastchannel.get(guildId), diagnostics: diagnosticsFor(null, client, config.relayTokens.length, sessions.has(guildId)) });
       return true;
     }
 
@@ -185,7 +200,7 @@ async function handleApi(req, res, sessions, client) {
     if (sub === "/stop" && req.method === "POST") {
       const body=await readJsonBody(req);
       if(!s && sessions.has(guildId)){const e=Error('This session changed. Refresh before stopping it.');e.status=409;throw e;}
-      send(res,200,stopSession(sessions,guildId,body.sessionId || idOf(s))); 
+      send(res,200,stopSession(sessions,guildId,body.sessionId || idOf(s),body.bridgeChoice)); 
       return true;
     }
 
@@ -202,6 +217,7 @@ async function handleApi(req, res, sessions, client) {
       if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       s.muted = typeof body.muted === "boolean" ? body.muted : !s.muted;
       if (s.muted) s.audio.stop();
+      sessions.runtime?.remember(s);sessions.runtime?.bridge?.reconcile();if(!s.muted)s.resumeSpeaking();
       await s.panelMessage?.edit(s.panel()).catch(() => {});
       send(res, 200, { muted: s.muted });
       return true;
@@ -226,22 +242,18 @@ async function handleApi(req, res, sessions, client) {
       const body = await readJsonBody(req);
       if(sessions.get(guildId)!==s || s.lifecycle){const e=Error('Session changed during this request.');e.status=409;throw e;}
       if (!Array.isArray(body.userIds)) { send(res, 400, { error: "userIds must be an array of Discord user ids." }); return true; }
-      s.additionalCallers = new Set(body.userIds.map(String));
+      s.additionalCallers = new Set(body.userIds.map(String));sessions.runtime?.remember(s);
       await s.panelMessage?.edit(s.panel()).catch(() => {});
       send(res, 200, { additionalCallers: [...s.additionalCallers] });
       return true;
     }
 
-    if (sub === "/bridge" && req.method === "POST") {
-      send(res, 501, { error: "Bridge control isn't available yet - it's still a work in progress." });
-      return true;
-    }
 
     send(res, 404, { error: "Not found" });
     return true;
   } catch (e) {
     console.error("[api]", req.method, url.pathname, e);
-    send(res, e.status || 500, { error: e.message || "Internal error" });
+    send(res, e.status || 500, { error: e.message || "Internal error",choices:e.choices });
     return true;
   }
 }

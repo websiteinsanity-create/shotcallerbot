@@ -25,6 +25,8 @@ module.exports = {
   partyCategoryPosition: (() => { const r = process.env.PARTY_CATEGORY_POSITION; return r !== undefined && r.trim() !== "" && Number.isInteger(Number(r)) && Number(r) >= 0 ? Number(r) : null; })(),
   additionalCallerRoleName: process.env.ADDITIONAL_CALLER_ROLE_NAME || "Shotcaller-People",
   bridgePartners,
+  insanityGuildId:process.env.INSANITY_GUILD_ID || '',
+  allianceGuildId:process.env.ALLIANCE_GUILD_ID || '',
   port: Number(process.env.PORT || 8787),
   // How long a speaker must be silent before their relayed stream is ended.
   whisperSilenceMs: Number(process.env.WHISPER_SILENCE_MS || 700),

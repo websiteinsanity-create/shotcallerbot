@@ -49,3 +49,6 @@ Docker:
 
 Then use:
   /shotcaller start
+
+## Alliance Bridge 4.5.1
+See ALLIANCE_BRIDGE_DE.md for the coordinated GuildHub 1.44.1 update, configuration and validation limits. Existing internal-session commands remain available.

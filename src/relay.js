@@ -11,6 +11,7 @@ function withTimeout(promise, ms, message) {
     .finally(() => clearTimeout(t));
 }
 
+const accounts=new Map();
 class Relay {
   constructor(token, index, opts = {}) {
     this.token = token;
@@ -22,22 +23,26 @@ class Relay {
     this.maxAttempts = opts.maxAttempts || 3;           // startup: join tries before giving up on this relay
     this.graceMs = opts.graceMs || 5000;                // after a drop: wait this long for a self-recovery before rejoining
     this.rejoins = 0;
-    this.client = new Client({
-      intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildVoiceStates]
-    });
+    let account=accounts.get(token);if(!account){account={client:new Client({intents:[GatewayIntentBits.Guilds,GatewayIntentBits.GuildVoiceStates]}),refs:0,login:null,guilds:new Set()};accounts.set(token,account);}this.account=account;account.refs++;this.client=account.client;
+    this.gatewayHandlers=[];const listen=(event,fn)=>{this.client.on(event,fn);this.gatewayHandlers.push([event,fn]);};
     this.connection = null;
-    this.client.on('shardDisconnect',()=>{this.voicePlayer?.stop(true);this.onVoiceState?.(this.index,'gateway-disconnected',this);this.operation?.event('relay.gateway.disconnected',{relay:this.index+1});});
-    for(const event of ['shardResume','clientReady'])this.client.on(event,()=>{if(this.connection)this.onVoiceState?.(this.index,this.connection.state.status,this);});
+    listen('shardDisconnect',()=>{this.disconnectedSince ||= Date.now();this.voicePlayer?.stop(true);this.onVoiceState?.(this.index,'gateway-disconnected',this);this.operation?.event('relay.gateway.disconnected',{relay:this.index+1});});
+    for(const event of ['shardResume','clientReady'])listen(event,()=>{if(this.connection){if(this.connection.state.status==='ready')this.disconnectedSince=null;this.onVoiceState?.(this.index,this.connection.state.status,this);}});
     // maxMissedFrames: by default the player gives up after 5 empty 20ms ticks (100ms). Network jitter easily causes
     // that, so let it ride out up to a second of gap instead of dropping the rest of the sentence.
     this.voicePlayer = createAudioPlayer({ behaviors: { maxMissedFrames: 50 } });
-    this.client.once("ready",()=>this.operation?.event("relay.gateway.ready",{relay:index+1,status:"ready"}));
-    this.client.on("error",error=>this.operation?.event("relay.gateway.error",{relay:index+1,error}));
+    listen("ready",()=>this.operation?.event("relay.gateway.ready",{relay:index+1,status:"ready"}));
+    listen("error",error=>this.operation?.event("relay.gateway.error",{relay:index+1,error}));
     this.voicePlayer.on("error",error=>this.operation?.event("relay.audio.error",{relay:index+1,error}));
     this.voicePlayer.on("stateChange",(oldS,newS)=>this.operation?.event("relay.audio.state",{relay:index+1,from:oldS.status,to:newS.status}));
   }
 
   async login(){
+    if(this.account.login)return this.account.login;
+    this.account.login=this._login().catch(error=>{this.account.login=null;throw error;});return this.account.login;
+  }
+  async _login(){
+    if(this.client.isReady?.())return;
     const started=Date.now();this.operation?.event("relay.login",{relay:this.index+1,status:"starting"});
     // client.login() can resolve before the gateway has finished logging the bot in. Joining voice in that
     // gap leaves the connection stuck at "disconnected" (the voice-state message can't be sent yet), so
@@ -70,6 +75,8 @@ class Relay {
   }
 
   async connect(channelId,guildId){
+    if(this.guildId && this.guildId!==guildId)throw Error('Relay connection is bound to one guild.');
+    if(!this.guildId){if(this.account.guilds.has(guildId))throw Error('Relay account already has a voice connection in this guild.');this.account.guilds.add(guildId);}
     this.channelId=channelId;this.guildId=guildId;
     const channel = await this.client.channels.fetch(channelId);
     if (!channel) throw new Error(`Relay ${this.index+1}: channel unavailable`);
@@ -87,7 +94,7 @@ class Relay {
       try {
         await entersState(connection, VoiceConnectionStatus.Ready, this.voiceTimeoutMs);
         if(this.destroyed || this.connection!==connection)throw Error("Relay start cancelled.");
-        this._watchDrops();
+        this.disconnectedSince=null;this.recoveryFailed=false;this._watchDrops();
         this.operation?.event("relay.ready",{relay:this.index+1,channelId,attempt,durationMs:Date.now()-started,status:"ready"});
         this.onVoiceState?.(this.index,"ready",this);
         return;
@@ -109,7 +116,8 @@ class Relay {
   _watchDrops(){
     const conn = this.connection;
     conn.on('stateChange',(_old,next)=>{
-      if(next.status===VoiceConnectionStatus.Ready){this.rejoins=0;this.recoveryFailed=false;return;}
+      if(next.status===VoiceConnectionStatus.Ready){this.rejoins=0;this.recoveryFailed=false;this.disconnectedSince=null;return;}
+      this.disconnectedSince ||= Date.now();
       if(!this.destroyed && this.connection===conn)this._recover(conn).catch(error=>this.operation?.event('relay.recovery.error',{relay:this.index+1,channelId:this.channelId,error}));
     });
   }
@@ -118,17 +126,20 @@ class Relay {
     if(this.recovering || this.destroyed || this.connection!==conn)return;
     this.recovering=true;const started=Date.now();
     try{
-      for(let attempt=0;attempt<=5 && !this.destroyed && this.connection===conn;attempt++){
-        if(conn.state.status===VoiceConnectionStatus.Destroyed){
-          await this.connect(this.channelId,this.guildId);return;
-        }
-        try{await entersState(conn,VoiceConnectionStatus.Ready,this.graceMs);return;}
-        catch(error){
-          if(this.destroyed || this.connection!==conn)return;
-          if(attempt===5){this.recoveryFailed=true;this.operation?.event('relay.recovery.exhausted',{relay:this.index+1,channelId:this.channelId,attempt,durationMs:Date.now()-started,status:conn.state.status,error});return;}
-          this.rejoins++;
-          this.operation?.event('relay.rejoin',{relay:this.index+1,channelId:this.channelId,attempt:attempt+1,status:conn.state.status,durationMs:Date.now()-started,error});
-          try{conn.rejoin();}catch(failure){this.operation?.event('relay.rejoin.failed',{relay:this.index+1,channelId:this.channelId,attempt:attempt+1,error:failure});}
+      this.disconnectedSince ||= Date.now();
+      let attempt=0,warned=false;
+      while(!this.destroyed){
+        conn=this.connection;
+        if(conn?.state.status===VoiceConnectionStatus.Ready){this.disconnectedSince=null;this.recoveryFailed=false;return;}
+        if(Date.now()-this.disconnectedSince>=30000 && !warned){warned=true;this.recoveryFailed=true;this.operation?.event('relay.recovery.warning',{relay:this.index+1,channelId:this.channelId,durationMs:Date.now()-this.disconnectedSince});}
+        try{
+          if(!conn || conn.state.status===VoiceConnectionStatus.Destroyed){await this.connect(this.channelId,this.guildId);return;}
+          await entersState(conn,VoiceConnectionStatus.Ready,this.graceMs);this.disconnectedSince=null;return;
+        }catch(error){
+          if(this.destroyed)return;
+          this.rejoins++;try{conn?.rejoin();}catch{}
+          const delay=[1000,2000,5000,10000,30000][Math.min(attempt++,4)];
+          await new Promise(resolve=>{this.recoveryWake=resolve;this.recoveryTimer=setTimeout(resolve,delay);});this.recoveryWake=null;
         }
       }
     }finally{this.recovering=false;}
@@ -147,13 +158,13 @@ class Relay {
   }
 
   async destroy(){
-    this.destroyed=true;
+    if(this.destroyed)return;this.destroyed=true;clearTimeout(this.recoveryTimer);this.recoveryWake?.();for(const [event,fn] of this.gatewayHandlers)this.client.removeListener(event,fn);
     const errors=[];
     try { this.voicePlayer.stop(true); } catch(e) { errors.push(e); }
     try { this.connection?.destroy(); } catch(e) { errors.push(e); }
     this.connection = null;
     // Wait for gateway logout too, while all voice/audio shutdown above stays immediate.
-    try { await this.client.destroy(); } catch(e) { errors.push(e); }
+    try { this.account.guilds.delete(this.guildId);if(--this.account.refs===0){accounts.delete(this.token);await this.client.destroy();} } catch(e) { errors.push(e); }
     if(errors.length)throw new AggregateError(errors,'Relay cleanup failed.');
   }
 }
