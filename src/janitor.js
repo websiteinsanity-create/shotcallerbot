@@ -81,7 +81,7 @@ function forget(ch) { watched.delete(ch.id); warned.delete(ch.id); untrack(ch.id
 
 // Find channels an earlier run left behind: everything on the bot's own list, plus (from before that list
 // existed) "Party N" voice channels inside the old Shotcaller category.
-async function sweep(guild) {
+async function sweep(guild,exclude=[]) {
   const found = new Map();
   for (const id of loadRegistry()[guild.id] || []) {
     const ch = guild.channels.cache.get(id);
@@ -94,7 +94,7 @@ async function sweep(guild) {
     }
   }
   if (found.size) console.log(`[cleanup] found ${found.size} leftover party channel(s) from an earlier session`);
-  for (const c of found.values()) await retire(c);
+  for (const c of found.values()) if(!exclude.includes(c.id))await retire(c);
 
   // The bot no longer uses its own category in "inplace" mode, so tidy an empty one away.
   if (cat && config.partyPlacement === "inplace") {

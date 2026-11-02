@@ -1,7 +1,7 @@
 const {
   Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder,
   ActionRowBuilder, StringSelectMenuBuilder, ModalBuilder,
-  TextInputBuilder, TextInputStyle
+  TextInputBuilder, TextInputStyle, ButtonBuilder, ButtonStyle, PermissionFlagsBits
 } = require("discord.js");
 const http=require("http");
 const config=require("./config");
@@ -25,12 +25,17 @@ const client=new Client({intents:[
   GatewayIntentBits.Guilds,GatewayIntentBits.GuildMembers,GatewayIntentBits.GuildVoiceStates
 ]});
 const sessions=new Map();
+const {Runtime}=require('./runtime');
+const runtime=new Runtime(sessions,client,config);
 
 const command=new SlashCommandBuilder()
   .setName("shotcaller").setDescription("Shotcaller control")
   .addSubcommand(s=>s.setName("start").setDescription("Start a Shotcaller session"))
   .addSubcommand(s=>s.setName("stop").setDescription("Stop the active Shotcaller session and clean up party channels"));
 
+function stopChoices(s){return {content:'Stop this internal session:',ephemeral:true,components:[new ActionRowBuilder().addComponents(
+  new ButtonBuilder().setCustomId('bridge-stop:keep:'+s.sessionId).setLabel('Keep Bridge Waiting').setStyle(ButtonStyle.Secondary),
+  new ButtonBuilder().setCustomId('bridge-stop:end:'+s.sessionId).setLabel('End Alliance Bridge').setStyle(ButtonStyle.Danger))]};}
 async function register(){
   const rest=new REST({version:"10"}).setToken(config.mainToken);
   const route=config.devGuildId?Routes.applicationGuildCommands(config.clientId,config.devGuildId):Routes.applicationCommands(config.clientId);
@@ -40,8 +45,9 @@ async function register(){
 client.once("ready",async()=>{
   console.log(`Shotcaller ${require("../package.json").version} online as ${client.user.tag}; Node ${process.version}`);
   await register();
+  await runtime.start();
   // Tidy up after any earlier run that stopped or restarted before it could clean its channels.
-  for(const guild of client.guilds.cache.values()) await janitor.sweep(guild).catch(e=>console.warn("[cleanup] startup sweep failed:",e.message));
+  for(const guild of client.guilds.cache.values()) await janitor.sweep(guild,runtime.saved.sessions[guild.id]?.channels?.map(c=>c.id) || []).catch(e=>console.warn("[cleanup] startup sweep failed:",e.message));
 });
 // After a session stops, occupied party channels are deleted the moment the last person leaves.
 client.on("voiceStateUpdate",(o,n)=>{ janitor.onVoiceUpdate(o,n).catch(e=>console.error("[cleanup]",e)); });
@@ -56,6 +62,7 @@ client.on("interactionCreate",async i=>{
         const s=sessions.get(i.guildId);
         if(!s) return i.reply({content:"No active Shotcaller session to stop.",ephemeral:true}).catch(e=>console.error(e));
         if(!canUse(i.member)) return i.reply({content:"You need the Shotcaller, Officer, Leader or Administrator permission.",ephemeral:true}).catch(e=>console.error(e));
+        if(runtime.bridge?.desired && runtime.bridge.belongs(i.guildId))return i.reply(stopChoices(s));
         stopSession(sessions,i.guildId,s.sessionId);
         await i.reply({content:"Stopping Shotcaller. Empty party channels are deleted now; any with people still in them are deleted as soon as they empty.",ephemeral:true}).catch(e=>console.error(e));
         try{ await s.panelMessage?.edit({content:"Shotcaller stopped.",embeds:[],components:[]}); }catch{}
@@ -90,6 +97,11 @@ client.on("interactionCreate",async i=>{
       return startSession(i,n,false);
     }
 
+    if(i.isButton() && i.customId.startsWith('bridge-stop:')){
+      if(!canUse(i.member))throw Error('No permission.');
+      const [,choice,id]=i.customId.split(':');stopSession(sessions,i.guildId,id,choice);
+      return i.update({content:'Shotcaller stopping.',components:[]});
+    }
     const s=activeSession(sessions,i.guildId);
     if(!s) return;
 
@@ -108,15 +120,11 @@ client.on("interactionCreate",async i=>{
       if(i.customId==="additional_setup") return i.reply({content:`Optional: add up to ${MAX_ADDITIONAL_CALLERS} extra callers for this game, on top of everyone with the ${config.additionalCallerRoleName} role. (Choosing here replaces the extras list; pick none to clear it.)`,components:[s.additionalMenu()],ephemeral:true}).catch(e=>console.error(e));
       if(i.customId==="bridge"){
         if(!canBridge(i.member)) return i.reply({content:"Officer/Leader/Admin required.",ephemeral:true}).catch(e=>console.error(e));
-        if(s.bridge?.active) s.bridge=null;
-        else {
-          const partner=config.bridgePartners.get(i.guildId);
-          if(!partner) return i.reply({content:"No partner guild is configured for this guild.",ephemeral:true}).catch(e=>console.error(e));
-          s.bridge={active:false,partnerGuildId:partner,requestedBy:i.guildId};
-          return i.reply({content:`Bridge request created for partner guild ${partner}. The partner side must accept.`,ephemeral:true}).catch(e=>console.error(e));
-        }
+        if(!runtime.bridge?.belongs(i.guildId))throw Error('Configure INSANITY_GUILD_ID and ALLIANCE_GUILD_ID.');
+        runtime.bridge.configure(i.guildId,runtime.bridge.desired?'end':'start');
       }
       if(i.customId==="stop"){
+        if(runtime.bridge?.desired && runtime.bridge.belongs(i.guildId))return i.reply(stopChoices(s));
         stopSession(sessions,i.guildId,s.sessionId);
         await i.update({content:"Shotcaller stopped. Empty party channels are deleted now; any with people still in them go as soon as they empty.",embeds:[],components:[]}).catch(e=>console.error(e));
         return;
@@ -132,13 +140,14 @@ client.on("interactionCreate",async i=>{
     }
 
     if(i.isUserSelectMenu() && i.customId==="additional_select"){
-      s.additionalCallers=new Set(i.values);
+      s.additionalCallers=new Set(i.values);runtime.remember(s);
       const msg=s.additionalCallers.size?`Extra callers set to ${[...s.additionalCallers].map(id=>`<@${id}>`).join(", ")}.`:"Extra callers cleared.";
       await i.update({content:msg,components:[]}).catch(e=>console.error(e));
       await s.panelMessage?.edit(s.panel());
       return;
     }
 
+    runtime.remember(s);
     await s.panelMessage?.edit(s.panel());
     if(!i.replied&&!i.deferred) await i.reply({content:"Updated.",ephemeral:true}).catch(e=>console.error(e));
   }catch(e){
@@ -163,7 +172,7 @@ async function startSession(i,count,bridge){
       await preflight({guild:i.guild,channel:i.member.voice.channel,count,config,client,operation});
       const session=new Session(i.guild,i.member.voice.channel,i.member.id,count);session.operation=operation;session.operationId=operation.id;return session;
     });
-    if(bridge)s.bridge={active:false,partnerGuildId:config.bridgePartners.get(i.guildId)||null};
+    if(bridge && runtime.bridge?.belongs(i.guildId))runtime.bridge.start(i.guildId);
     lastchannel.remember(i.guildId,i.member.voice.channel);
     try{s.panelMessage=await i.channel.send(s.panel());}catch(e){console.warn('Could not post Shotcaller panel:',e.message);}
     if(activeSession(sessions,i.guildId)!==s){try{await s.panelMessage?.edit({content:'Shotcaller stopped.',embeds:[],components:[]});}catch{}return;}
@@ -189,4 +198,5 @@ http.createServer((req,res)=>{
   });
 }).listen(config.port,()=>console.log(`Health endpoint on :${config.port}${config.controlApiKey?" (control API enabled)":" (control API disabled - set CONTROL_API_KEY to enable)"}`));
 
+for(const signal of ['SIGINT','SIGTERM'])process.once(signal,()=>{runtime.shutdown().finally(()=>client.destroy()).finally(()=>process.exit(0));});
 client.login(config.mainToken);

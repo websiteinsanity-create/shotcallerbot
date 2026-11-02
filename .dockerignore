@@ -1,6 +1,5 @@
 node_modules
-.env
 data
-dist_out
-*.log
+.env
 .git
+*.log
