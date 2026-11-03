@@ -106,10 +106,10 @@ client.on("interactionCreate",async i=>{
     if(!s) return;
 
     if(i.isButton() && i.customId==="callout_toggle"){
-      if(!s.isAdditionalCaller(i.user.id)) return i.reply({content:`You need the ${config.additionalCallerRoleName} role to make callouts.`,ephemeral:true}).catch(e=>console.error(e));
+      if(!s.canCallout(i.user.id)) return i.reply({content:`You need the ${config.additionalCallerRoleName} role to make callouts.`,ephemeral:true}).catch(e=>console.error(e));
       const on=s.toggleCallout(i.user.id);
       const secs=Math.round(config.calloutAutoOffMs/1000);
-      return i.reply({content:on?`📢 Callout is open for ${secs}s. It is routed to the available main caller, or to all other parties if no main caller is available. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
+      return i.reply({content:on?`📢 Callout is open for ${secs}s. During an Alliance Bridge it reaches configured Bridge Mains; only with no configured Bridge Main does it reach all other parties. Without a bridge it follows the internal session routing. It closes itself automatically, or click again to close it early.`:"🔇 Callout closed.",ephemeral:true}).catch(e=>console.error(e));
     }
 
     if(!canUse(i.member)) return i.reply({content:"No permission.",ephemeral:true}).catch(e=>console.error(e));

@@ -4,13 +4,13 @@ const {OpusEncoder}=require('@discordjs/opus');
 const {VoiceMixer}=require('./mixer');
 class AudioRouter {
  constructor(session){this.s=session;this.streams=new Map();this.mixers=new Map();this.stats={started:0,packets:0,lastRoute:null,recentRoutes:[]};}
- mixer(target){if(this.s.bridge?.active){this.mixers=this.s.bridge.mixers;}if(!this.mixers.has(target))this.mixers.set(target,new VoiceMixer({bufferMs:this.s.bridge?.active?this.s.bridge.bufferMs:0,encoder:new OpusEncoder(48000,2),play:stream=>target.playOpus(stream)}));return this.mixers.get(target);}
+ mixer(target){if(this.s.bridge?.routingReady){this.mixers=this.s.bridge.mixers;}if(!this.mixers.has(target))this.mixers.set(target,new VoiceMixer({bufferMs:this.s.bridge?.routingReady?this.s.bridge.bufferMs:0,encoder:new OpusEncoder(48000,2),play:stream=>target.playOpus(stream)}));return this.mixers.get(target);}
  route(userId,sourceIndex,receiver,additional){
  if(this.s.muted || this.s.paused || !receiver || !userId || this.s.guild?.members?.cache.get(userId)?.user?.bot || this.s.relays.some(r=>r.client?.user?.id===userId) || this.s.guild?.client?.user?.id===userId)return;
  const source=sourceIndex<0?this.s.main:this.s.relays[sourceIndex]?.connection;
  if(!source || source.state.status!=='ready' || source.receiver!==receiver || (sourceIndex>=0 && this.s.relays[sourceIndex]?.client?.isReady?.()===false))return;
- if(additional?!this.s.additionalCallActive(userId):!this.s.dedicated.has(userId))return;
- const key=(this.s.bridge?.active?this.s.guild.id+':':'')+(additional?'extra:':'main:')+userId;if(this.streams.get(key)?.receiver===receiver)return;
+ if(additional?!this.s.additionalCallActive(userId):!this.s.dedicated.has(userId) || this.s.additionalCallActive(userId))return;
+ const key=(this.s.bridge?.routingReady?this.s.guild.id+':':'')+(additional?'extra:':'main:')+userId;if(this.streams.get(key)?.receiver===receiver)return;
  if(this.streams.has(key))this.stopKey(key);
  const sourceId=sourceIndex<0?this.s.mainChannelId:this.s.channels[sourceIndex]?.id;
  const targets=this.targets(sourceId,additional,userId);
@@ -18,14 +18,17 @@ class AudioRouter {
  let stream=receiver.subscribe(userId,{end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}});
  if(stream.destroyed){receiver.subscriptions?.delete(userId);stream=receiver.subscribe(userId,{end:{behavior:EndBehaviorType.AfterSilence,duration:this.s.config.whisperSilenceMs}});}
  const decoder=new OpusEncoder(48000,2),mixers=targets.map(t=>this.mixer(t));let ended=false;
- this.streams.set(key,{stream,mixers,receiver,sourceId,additional,userId});mixers.forEach(m=>m.add(key));this.stats.started++;this.stats.lastRoute={at:Date.now(),kind:additional?'callout':'main',sourceChannelId:sourceId,sourceGuildId:this.s.guild?.id || null,targetChannelIds:targets.map(t=>{for(const s of this.s.bridge?.active?this.s.bridge.attached:[this.s]){if(t===s.followTarget)return s.mainChannelId;const i=s.relays.indexOf(t);if(i>=0)return s.channels[i]?.id;}return null;})};
+ this.streams.set(key,{stream,mixers,receiver,sourceId,additional,userId});mixers.forEach(m=>m.add(key));this.stats.started++;this.stats.lastRoute={at:Date.now(),kind:additional?'callout':'main',sourceChannelId:sourceId,sourceGuildId:this.s.guild?.id || null,targetChannelIds:targets.map(t=>{for(const s of this.s.bridge?.routingReady?this.s.bridge.attached:[this.s]){if(t===s.followTarget)return s.mainChannelId;const i=s.relays.indexOf(t);if(i>=0)return s.channels[i]?.id;}return null;})};
  this.stats.recentRoutes.unshift(this.stats.lastRoute);this.stats.recentRoutes=this.stats.recentRoutes.slice(0,20);
  const end=()=>{if(ended)return;ended=true;if(this.streams.get(key)?.stream!==stream)return;this.streams.delete(key);mixers.forEach(m=>m.end(key));};
  stream.on('data',packet=>{if(this.s.muted || this.s.paused)return;try{const pcm=decoder.decode(packet);this.stats.packets++;mixers.forEach(m=>m.push(key,pcm));}catch(error){console.error('[audio] decode failed:',error.message);}});
  stream.once('end',end);stream.once('close',end);stream.once('error',error=>{console.error('[audio] receive error:',error.message);end();});
  }
  targets(sourceId,additional,userId){
-  if(this.s.bridge?.active)return this.s.bridge.targets(this.s,sourceId,additional,userId);
+  if(this.s.bridge?.routingReady)return this.s.bridge.targets(this.s,sourceId,additional,userId);
+  // Bridge requested (not paused) but not routing yet: callouts still reach this guild's own available
+  // main caller, but never fall back to an all-party broadcast. While paused, normal internal rules apply.
+  if(additional && this.s.bridge?.desired && !this.s.bridge.paused && !this.s.mainCaller.snapshot().available)return [];
   let targets=this.s.relays.filter((r,i)=>this.s.channels[i]?.id!==sourceId && r.connection?.state.status==='ready' && r.client?.isReady?.()!==false);
   const main=this.s.mainCaller.snapshot();
   if(additional && main.available)targets=targets.filter(r=>this.s.channels[this.s.relays.indexOf(r)]?.id===main.channelId);
