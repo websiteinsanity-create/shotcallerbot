@@ -74,7 +74,7 @@ class Session {
     for(const c of this.channels){
       this.ensureStarting();
       await c.send({
-        content:`🎙️ Talk normally with your party here.\nAdditional callers (**${config.additionalCallerRoleName}** role): press the button for a ${secs}-second callout to the main caller, or all other parties when no main caller is available.`,
+        content:`🎙️ Talk normally with your party here.\nAdditional callers (**${config.additionalCallerRoleName}** role): press the button for a ${secs}-second callout to the main caller, or all other parties when no main caller is available. With an Alliance Bridge, only configured Bridge Mains receive callouts unless no Bridge Main is configured.`,
         components:[this.calloutRow()]
       }).catch(()=>{});
     }
@@ -106,7 +106,7 @@ class Session {
     if(this.startCancelled || !this.audio || this.paused || this.muted)return;
     for(let i=-1;i<this.relays.length;i++){const receiver=i<0?this.main?.receiver:this.relays[i]?.connection?.receiver;
       for(const user of receiver?.speaking?.users?.keys?.() || []){
-        if(this.dedicated.has(user))this.audio.broadcast(user,i,receiver);
+        if(this.dedicated.has(user) && !this.additionalCallActive(user))this.audio.broadcast(user,i,receiver);
         else if(this.additionalCallActive(user))this.audio.additionalBroadcast(i,user,receiver);
       }
     }
@@ -121,7 +121,7 @@ class Session {
     this.wiredReceivers ||= new WeakSet();this.wiredReceivers.add(receiver);
     receiver.speaking.on('start',userId=>{
       const relay=this.relays[index];if(relay?.connection?.receiver!==receiver || relay.connection.state.status!=='ready' || relay.client?.isReady?.()===false)return;
-      if(this.dedicated.has(userId))return this.audio.broadcast(userId,index,receiver);
+      if(this.dedicated.has(userId) && !this.additionalCallActive(userId))return this.audio.broadcast(userId,index,receiver);
       if(this.additionalCallActive(userId))this.audio.additionalBroadcast(index,userId,receiver);
     });
   }
@@ -135,7 +135,7 @@ class Session {
     this.wireReceiver(index);this.syncMainCaller();this.audio.refreshTargets();
     const receiver=relay.connection?.receiver;
     for(const user of receiver?.speaking?.users?.keys?.() || []){
-      if(this.dedicated.has(user))this.audio.broadcast(user,index,receiver);
+      if(this.dedicated.has(user) && !this.additionalCallActive(user))this.audio.broadcast(user,index,receiver);
       else if(this.additionalCallActive(user))this.audio.additionalBroadcast(index,user,receiver);
     }
   }
@@ -167,6 +167,7 @@ class Session {
     const signature=(id || '')+':'+(channelId || '');
     const ready=managed?(this.relays[index]?.connection?.state.status==='ready' && this.relays[index]?.client?.isReady?.()!==false):this.mainChannelId===channelId && this.main?.state.status==='ready';
     this.mainCaller.observe(channelId,!!ready,this.followError || null);
+    this.bridge?.reconcile();
     if(signature===this.followSignature && (managed || !channelId || ready || this.followPending || Date.now()<this.followRetryAt))return;
     this.followSignature=signature;this.followRetryAt=Date.now()+5000;
     const generation=++this.followGeneration;this.followPending=false;
@@ -198,8 +199,9 @@ class Session {
     await entersState(conn,VoiceConnectionStatus.Ready,20000);
     if(generation!==this.followGeneration || this.startCancelled){try{conn.destroy();}catch{}return;}
     this.followTarget={playOpus:stream=>{if(this.paused || this.main!==conn || conn.state.status!=='ready'){stream.destroy();return;}this.followPlayer.play(createAudioResource(stream,{inputType:StreamType.Opus}));}};
-    conn.receiver.speaking.on('start',user=>{if(this.main===conn && this.dedicated.has(user))this.audio.broadcast(user,-1,conn.receiver);});
-    this.mainCaller.observe(channelId,true);this.audio?.refreshTargets();
+    watchSpeakingFlags(conn,'main follow '+this.guild.id,(user,flags)=>{if(this.main===conn)this.onSpeakingFlags(user,flags);});
+    conn.receiver.speaking.on('start',user=>{if(this.main!==conn || conn.state.status!=='ready')return;if(this.additionalCallActive(user))this.audio.additionalBroadcast(-1,user,conn.receiver);else if(this.dedicated.has(user))this.audio.broadcast(user,-1,conn.receiver);});
+    this.mainCaller.observe(channelId,true);this.bridge?.reconcile();this.audio?.refreshTargets();
   }
 
   // Creates Party 2..N. Where they go depends on PARTY_PLACEMENT:
@@ -280,6 +282,8 @@ class Session {
     return member.roles.cache.has(this.callerRoleId);
   }
 
+  canCallout(userId){return this.dedicated.has(userId) || this.isAdditionalCaller(userId);}
+
   // Role holders are additional callers automatically; the manual picker only adds extras on top.
   isAdditionalCaller(userId){
     return this.additionalCallers.has(userId) || this.hasCallerRole(userId);
@@ -287,13 +291,13 @@ class Session {
 
   // Is this person allowed to be heard by everyone right now? (button window open, or priority key held)
   additionalCallActive(userId){
-    if(this.paused || !this.isAdditionalCaller(userId)) return false;
-    if(this.dedicated.has(userId)) return false; // the primary caller is already handled by the main broadcast
+    if(this.paused || !this.canCallout(userId)) return false;
+    if(this.dedicated.has(userId) && (!this.bridge?.desired || this.bridge.paused)) return false; // the primary caller is already handled by the main broadcast
     return this.calloutOpen.get(userId)===true || this.priorityHeld.get(userId)===true;
   }
 
   stopIfIdle(userId){
-    if(!this.additionalCallActive(userId)) this.audio?.stopAdditionalFor(userId);
+    if(!this.additionalCallActive(userId)) {this.audio?.stopAdditionalFor(userId);this.resumeSpeaking();}
   }
 
   // If someone opens their window while already mid-sentence, start relaying straight away
@@ -304,15 +308,18 @@ class Session {
       const receiver=this.relays[j].connection?.receiver;
       if(receiver?.speaking?.users?.has?.(userId)){ this.audio.additionalBroadcast(j,userId,receiver); return; }
     }
+    const receiver=this.main?.receiver;
+    if(receiver?.speaking?.users?.has?.(userId))this.audio.additionalBroadcast(-1,userId,receiver);
   }
 
   // Button: opens a window of calloutAutoOffMs, closes itself, or click again to close early.
   toggleCallout(userId){
-    if(this.paused || !this.isAdditionalCaller(userId)) return null; // caller shows the "not authorised" message
+    if(this.paused || !this.canCallout(userId)) return null; // caller shows the "not authorised" message
     clearTimeout(this.calloutTimers.get(userId));
     const next=!(this.calloutOpen.get(userId)===true);
     this.calloutOpen.set(userId,next);
     if(next){
+      if(this.dedicated.has(userId) && this.bridge?.desired)this.audio?.stopBroadcast();
       this.calloutTimers.set(userId,setTimeout(()=>{
         this.calloutOpen.set(userId,false); this.calloutTimers.delete(userId); this.stopIfIdle(userId);
       },this.config.calloutAutoOffMs));
@@ -328,14 +335,15 @@ class Session {
   // "Push to Talk (Priority)" keybind should set — held key = open line, released = closed.
   // (Unverified until the [flags] log lines have been checked against a real key press.)
   onSpeakingFlags(userId,flags){
-    this.lastPrioritySignal={at:Date.now(),userId,flags:Number(flags),authorised:this.isAdditionalCaller(userId),paused:this.paused};
-    if(this.paused || !this.isAdditionalCaller(userId)) return;
+    this.lastPrioritySignal={at:Date.now(),userId,flags:Number(flags),authorised:this.canCallout(userId),paused:this.paused};
+    if(this.paused || !this.canCallout(userId)) return;
     const held=(Number(flags)&4)!==0;
     if(held===(this.priorityHeld.get(userId)===true)) return;
     clearTimeout(this.priorityTimers.get(userId));
     this.priorityHeld.set(userId,held);
     console.log(`[callout] ${userId} priority key ${held?"held":"released"}`);
     if(held){
+      if(this.dedicated.has(userId) && this.bridge?.desired)this.audio?.stopBroadcast();
       // Safety net: a lost "released" message must never leave a line stuck open.
       this.priorityTimers.set(userId,setTimeout(()=>{
         this.priorityHeld.set(userId,false); this.priorityTimers.delete(userId); this.stopIfIdle(userId);

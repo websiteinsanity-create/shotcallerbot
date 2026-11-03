@@ -1,13 +1,13 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),{EventEmitter}=require('node:events'),vm=require('node:vm'),fs=require('node:fs');
 const MAIN='100000000000000001';
-function harness(){const joined=[],module={exports:{}},client=new EventEmitter();client.user={id:'main-bot'};
+function harness(){const watched=[],joined=[],module={exports:{}},client=new EventEmitter();client.user={id:'main-bot'};
  const channel=id=>({id,name:id,type:2,permissionsFor:()=>({has:()=>true})});const cache=new Map(['managed','external','other'].map(id=>[id,channel(id)]));
  const guild={id:'guild',client,members:{me:{},cache:new Map()},channels:{cache,fetch:async id=>cache.get(id)},voiceStates:{cache:new Map()},voiceAdapterCreator:{}};
  const voice={VoiceConnectionStatus:{Ready:'ready'},joinVoiceChannel:opts=>{const c=new EventEmitter();c.state={status:'ready'};c.receiver={speaking:new EventEmitter()};c.subscribe=()=>{};c.destroy=()=>{c.state.status='destroyed';};joined.push({...opts,conn:c});return c;},entersState:async()=>{},createAudioPlayer:()=>Object.assign(new EventEmitter(),{stop(){},play(){}}),createAudioResource:x=>x,StreamType:{Opus:'opus'}};
- vm.runInNewContext(fs.readFileSync(require('node:path').join(__dirname,'../src/session.js'),'utf8'),{module,console,setInterval,clearInterval,setTimeout,clearTimeout,require:name=>name==='discord.js'?{ChannelType:{GuildVoice:2},PermissionFlagsBits:{}}:name==='@discordjs/voice'?voice:name==='./main-caller'?require('../src/main-caller'):name==='./config'?{}:name==='./janitor'?{retire:async()=>{}}:{}});
+ vm.runInNewContext(fs.readFileSync(require('node:path').join(__dirname,'../src/session.js'),'utf8'),{module,console,setInterval,clearInterval,setTimeout,clearTimeout,require:name=>name==='discord.js'?{ChannelType:{GuildVoice:2},PermissionFlagsBits:{}}:name==='@discordjs/voice'?voice:name==='./speakingflags'?{watchSpeakingFlags:(conn,label,onFlags)=>watched.push({conn,onFlags})}:name==='./main-caller'?require('../src/main-caller'):name==='./config'?{}:name==='./janitor'?{retire:async()=>{}}:{}});
  const s=new module.exports.Session(guild,cache.get('managed'),MAIN,1);s.channels=[cache.get('managed')];s.relays=[{connection:{state:{status:'ready'}},destroy:async()=>{}}];let stops=0;s.audio={stop:()=>stops++,stopBroadcast(){},stopAdditionalFor(){},dropTarget(){},refreshTargets(){}};
  const move=id=>{guild.voiceStates.cache.set(MAIN,{channelId:id});s.syncMainCaller();};
- return {s,joined,move,stops:()=>stops};}
+ return {s,joined,watched,move,stops:()=>stops};}
 const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
 test('main bot stays in background in managed channel, follows external caller and leaves on return',async()=>{const h=harness();try{h.move('managed');assert.equal(h.joined.length,0);assert(h.s.mainCaller.snapshot().available);h.move('external');await flush();assert.equal(h.joined.length,1);assert.equal(h.joined[0].channelId,'external');assert(h.s.mainCaller.snapshot().available);h.move('managed');assert.equal(h.joined[0].conn.state.status,'destroyed');assert.equal(h.s.main,null);assert(h.s.mainCaller.snapshot().available);}finally{await h.s.destroy();}});
 test('pause keeps current connection, stops audio and defers follow until resume',async()=>{const h=harness();try{h.move('external');await flush();const conn=h.s.main;h.s.setPaused(true);h.move('other');assert.equal(h.joined.length,1);assert.equal(conn.state.status,'ready');assert(h.stops()>0);h.s.setPaused(false);await flush();assert.equal(h.joined.length,2);assert.equal(h.joined[1].channelId,'other');assert.equal(conn.state.status,'destroyed');}finally{await h.s.destroy();}});
@@ -15,3 +15,11 @@ test('rapid main caller moves cannot let an older follow overwrite the current t
 test('replacement remains selected when the original caller returns',async()=>{const h=harness();try{const replacement='100000000000000002';h.s.setDedicated([replacement]);h.move('external');await flush();assert.equal(h.s.mainCaller.id,replacement);assert.equal(h.s.main,null);}finally{await h.s.destroy();}});
 
 test('resume preserves a ready connection when the main caller has not moved',async()=>{const h=harness();try{h.move('external');await flush();const conn=h.s.main;h.s.setPaused(true);h.s.setPaused(false);await flush();assert.equal(h.s.main,conn);assert.equal(h.joined.length,1);assert.equal(conn.state.status,'ready');}finally{await h.s.destroy();}});
+
+test('priority key on a followed external connection reaches the same session gate and stops at release',async()=>{const h=harness();try{
+ h.s.config.calloutAutoOffMs=20000;h.s.bridge={desired:true,routingReady:true,reconcile(){}};h.move('external');await flush();
+ assert.equal(h.watched.length,1);assert.equal(h.watched[0].conn,h.s.main);
+ h.watched[0].onFlags(MAIN,5);assert(h.s.priorityHeld.get(MAIN));assert(h.s.additionalCallActive(MAIN));
+ h.watched[0].onFlags(MAIN,1);assert(!h.s.priorityHeld.get(MAIN));
+ const old=h.watched[0];h.move('managed');old.onFlags(MAIN,5);assert(!h.s.priorityHeld.get(MAIN));
+}finally{await h.s.destroy();}});

@@ -48,7 +48,7 @@ function cleanBridge(b, notes) {
   const out = {};
   for (const [key, value] of Object.entries(b)) {
     let ok = true;
-    if (key === 'desired' || key === 'allowAllianceManage') ok = typeof value === 'boolean';
+    if (key === 'desired' || key === 'paused' || key === 'allowAllianceManage') ok = typeof value === 'boolean';
     else if (key === 'bufferMs') ok = [20, 40, 60, 80, 100].includes(value);
     else if (key === 'id') ok = typeof value === 'string' && value.length <= 80;
     else if (key === 'mainEnabled') ok = object(value) && Object.entries(value).every(([k, v]) => id(k) && typeof v === 'boolean');
